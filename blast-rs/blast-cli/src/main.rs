@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use clap::{Parser, Subcommand};
-use blast_db::BlastDb;
+use blast_db::{BlastDb, BlastDbBuilder, SequenceEntry};
+use blast_db::index::SeqType;
 use blast_core::{
     SearchParams,
     matrix::MatrixType,
@@ -26,6 +27,8 @@ enum Commands {
     Blastn(BlastArgs),
     /// Dump sequences from a BLAST database (for testing)
     Dumpdb(DumpArgs),
+    /// Build a BLAST database from a FASTA file
+    Makeblastdb(MakeDbArgs),
 }
 
 #[derive(clap::Args)]
@@ -94,12 +97,32 @@ struct DumpArgs {
     volumes: bool,
 }
 
+#[derive(clap::Args)]
+struct MakeDbArgs {
+    /// Input FASTA file
+    #[arg(short = 'i', long = "in")]
+    input: PathBuf,
+    /// Sequence type: prot or nucl
+    #[arg(long, default_value = "prot")]
+    dbtype: String,
+    /// Output database base path (without extension)
+    #[arg(short, long)]
+    out: PathBuf,
+    /// Database title (defaults to output path)
+    #[arg(long)]
+    title: Option<String>,
+    /// Parse FASTA headers as "accession description" (first word = accession)
+    #[arg(long, default_value = "true")]
+    parse_seqids: bool,
+}
+
 fn main() {
     let cli = Cli::parse();
     match &cli.command {
-        Commands::Blastp(args) => run_blastp(args),
-        Commands::Blastn(args) => run_blastn(args),
-        Commands::Dumpdb(args) => run_dumpdb(args),
+        Commands::Blastp(args)      => run_blastp(args),
+        Commands::Blastn(args)      => run_blastn(args),
+        Commands::Dumpdb(args)      => run_dumpdb(args),
+        Commands::Makeblastdb(args) => run_makeblastdb(args),
     }
 }
 
@@ -263,6 +286,58 @@ fn run_blastn(args: &BlastArgs) {
     } else if fmt.fmt_id == 15 {
         output::write_json_footer(&mut out).unwrap();
     }
+}
+
+fn run_makeblastdb(args: &MakeDbArgs) {
+    let seq_type = match args.dbtype.to_ascii_lowercase().as_str() {
+        "prot" | "protein" => SeqType::Protein,
+        "nucl" | "nucleotide" => SeqType::Nucleotide,
+        other => {
+            eprintln!("Unknown dbtype '{}'. Use 'prot' or 'nucl'.", other);
+            std::process::exit(1);
+        }
+    };
+
+    let db_title = args.title.clone().unwrap_or_else(|| {
+        args.out.to_string_lossy().into_owned()
+    });
+
+    let sequences = read_fasta(&args.input).unwrap_or_else(|e| {
+        eprintln!("Error reading input FASTA: {}", e);
+        std::process::exit(1);
+    });
+
+    if sequences.is_empty() {
+        eprintln!("No sequences found in input file.");
+        std::process::exit(1);
+    }
+
+    let mut builder = BlastDbBuilder::new(seq_type, &db_title);
+    for (header, seq) in sequences {
+        let (accession, title) = if args.parse_seqids {
+            let mut words = header.splitn(2, ' ');
+            let acc = words.next().unwrap_or(&header).to_string();
+            let ttl = words.next().unwrap_or("").to_string();
+            (acc, ttl)
+        } else {
+            (header.clone(), header.clone())
+        };
+        builder.add(SequenceEntry { title, accession, sequence: seq, taxid: None });
+    }
+
+    builder.write(&args.out).unwrap_or_else(|e| {
+        eprintln!("Error writing database: {}", e);
+        std::process::exit(1);
+    });
+
+    let n = builder.entries.len();
+    let ext = match seq_type { SeqType::Protein => "pin", SeqType::Nucleotide => "nin" };
+    eprintln!(
+        "Database written: {} sequences → {}.{}",
+        n,
+        args.out.display(),
+        ext
+    );
 }
 
 fn run_dumpdb(args: &DumpArgs) {

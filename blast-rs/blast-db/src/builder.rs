@@ -1,0 +1,358 @@
+//! BlastDB v4 writer – creates protein (.pin/.psq/.phr) and nucleotide (.nin/.nsq/.nhr) databases.
+
+use std::fs;
+use std::path::Path;
+use byteorder::{BigEndian, LittleEndian, WriteBytesExt};
+use crate::error::Result;
+use crate::index::SeqType;
+
+/// One sequence to be added to the database.
+pub struct SequenceEntry {
+    pub title: String,
+    pub accession: String,
+    /// Raw ASCII sequence bytes (uppercase preferred).
+    pub sequence: Vec<u8>,
+    pub taxid: Option<u32>,
+}
+
+/// Accumulates sequences and writes a v4 BLAST database.
+pub struct BlastDbBuilder {
+    pub seq_type: SeqType,
+    pub db_title: String,
+    pub entries: Vec<SequenceEntry>,
+}
+
+impl BlastDbBuilder {
+    pub fn new(seq_type: SeqType, db_title: impl Into<String>) -> Self {
+        BlastDbBuilder { seq_type, db_title: db_title.into(), entries: Vec::new() }
+    }
+
+    pub fn add(&mut self, entry: SequenceEntry) {
+        self.entries.push(entry);
+    }
+
+    /// Write all database files to `base_path` (without extension).
+    pub fn write(&self, base_path: &Path) -> Result<()> {
+        match self.seq_type {
+            SeqType::Protein    => self.write_protein(base_path),
+            SeqType::Nucleotide => self.write_nucleotide(base_path),
+        }
+    }
+
+    // ── Protein ─────────────────────────────────────────────────────────────
+
+    fn write_protein(&self, base: &Path) -> Result<()> {
+        let mut seq_data: Vec<u8> = Vec::new();
+        let mut hdr_data: Vec<u8> = Vec::new();
+        let mut sequence_array: Vec<u32> = Vec::new();
+        let mut header_array: Vec<u32> = Vec::new();
+        let mut max_seq_length = 0u32;
+        let mut volume_length  = 0u64;
+
+        for entry in &self.entries {
+            header_array.push(hdr_data.len() as u32);
+            hdr_data.extend(encode_defline_ber(&entry.title, &entry.accession, entry.taxid));
+
+            sequence_array.push(seq_data.len() as u32);
+            let enc = encode_protein_seq(&entry.sequence);
+            let slen = enc.len() as u32;
+            seq_data.extend_from_slice(&enc);
+            seq_data.push(0x00); // NUL terminator
+            volume_length  += slen as u64;
+            if slen > max_seq_length { max_seq_length = slen; }
+        }
+        // Sentinel entries (num_oids+1 each)
+        header_array.push(hdr_data.len() as u32);
+        sequence_array.push(seq_data.len() as u32);
+
+        fs::write(base.with_extension("psq"), &seq_data)?;
+        fs::write(base.with_extension("phr"), &hdr_data)?;
+        fs::write(base.with_extension("pin"), build_index(
+            SeqType::Protein, &self.db_title,
+            self.entries.len() as u32, volume_length, max_seq_length,
+            &header_array, &sequence_array, None,
+        ))?;
+        Ok(())
+    }
+
+    // ── Nucleotide ───────────────────────────────────────────────────────────
+
+    fn write_nucleotide(&self, base: &Path) -> Result<()> {
+        let mut seq_data: Vec<u8> = Vec::new();
+        let mut hdr_data: Vec<u8> = Vec::new();
+        let mut sequence_array: Vec<u32> = Vec::new();
+        let mut ambig_array:    Vec<u32> = Vec::new();
+        let mut header_array:   Vec<u32> = Vec::new();
+        let mut max_seq_length = 0u32;
+        let mut volume_length  = 0u64;
+
+        for entry in &self.entries {
+            header_array.push(hdr_data.len() as u32);
+            hdr_data.extend(encode_defline_ber(&entry.title, &entry.accession, entry.taxid));
+
+            sequence_array.push(seq_data.len() as u32);
+            let (packed, ambig) = encode_nucleotide_seq(&entry.sequence);
+            seq_data.extend_from_slice(&packed);
+            ambig_array.push(seq_data.len() as u32); // end of packed = start of ambig
+            seq_data.extend_from_slice(&ambig);
+
+            let slen = entry.sequence.len() as u32;
+            volume_length  += slen as u64;
+            if slen > max_seq_length { max_seq_length = slen; }
+        }
+        // Sentinel entries (num_oids+1 each)
+        header_array.push(hdr_data.len() as u32);
+        sequence_array.push(seq_data.len() as u32);
+        ambig_array.push(seq_data.len() as u32); // unused sentinel
+
+        fs::write(base.with_extension("nsq"), &seq_data)?;
+        fs::write(base.with_extension("nhr"), &hdr_data)?;
+        fs::write(base.with_extension("nin"), build_index(
+            SeqType::Nucleotide, &self.db_title,
+            self.entries.len() as u32, volume_length, max_seq_length,
+            &header_array, &sequence_array, Some(&ambig_array),
+        ))?;
+        Ok(())
+    }
+}
+
+// ─── Index file serialisation ────────────────────────────────────────────────
+
+fn build_index(
+    seq_type: SeqType,
+    title: &str,
+    num_oids: u32,
+    volume_length: u64,
+    max_seq_length: u32,
+    header_array: &[u32],
+    sequence_array: &[u32],
+    ambig_array: Option<&[u32]>,
+) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+
+    // format_version = 4 (BigEndian)
+    buf.write_i32::<BigEndian>(4).unwrap();
+    // seq_type: 1=protein, 0=nucleotide
+    buf.write_i32::<BigEndian>(match seq_type {
+        SeqType::Protein    => 1,
+        SeqType::Nucleotide => 0,
+    }).unwrap();
+
+    write_be_string(&mut buf, title);
+    write_be_string(&mut buf, ""); // create_date (empty)
+
+    buf.write_u32::<BigEndian>(num_oids).unwrap();
+    buf.write_u64::<LittleEndian>(volume_length).unwrap(); // LITTLE-endian!
+    buf.write_u32::<BigEndian>(max_seq_length).unwrap();
+
+    for &v in header_array   { buf.write_u32::<BigEndian>(v).unwrap(); }
+    for &v in sequence_array { buf.write_u32::<BigEndian>(v).unwrap(); }
+    if let Some(arr) = ambig_array {
+        for &v in arr { buf.write_u32::<BigEndian>(v).unwrap(); }
+    }
+
+    buf
+}
+
+/// Write a length-prefixed string as used in the index (i32 BE length + bytes).
+fn write_be_string(buf: &mut Vec<u8>, s: &str) {
+    buf.write_i32::<BigEndian>(s.len() as i32).unwrap();
+    buf.extend_from_slice(s.as_bytes());
+}
+
+// ─── Protein encoding ────────────────────────────────────────────────────────
+
+fn encode_protein_seq(seq: &[u8]) -> Vec<u8> {
+    seq.iter().map(|&c| ascii_to_ncbistdaa(c)).collect()
+}
+
+fn ascii_to_ncbistdaa(c: u8) -> u8 {
+    match c.to_ascii_uppercase() {
+        b'A' => 1,  b'B' => 2,  b'C' => 3,  b'D' => 4,  b'E' => 5,
+        b'F' => 6,  b'G' => 7,  b'H' => 8,  b'I' => 9,  b'K' => 10,
+        b'L' => 11, b'M' => 12, b'N' => 13, b'P' => 14, b'Q' => 15,
+        b'R' => 16, b'S' => 17, b'T' => 18, b'V' => 19, b'W' => 20,
+        b'X' => 21, b'Y' => 22, b'Z' => 23, b'U' => 24, b'*' => 25,
+        b'O' => 26, b'J' => 27,
+        _ => 21, // unknown → X
+    }
+}
+
+// ─── Nucleotide encoding ─────────────────────────────────────────────────────
+
+/// Returns `(packed_na2_bytes, ambig_data_bytes)`.
+///
+/// Packed NcbiNa2: 4 bases/byte MSB-first (A=0, C=1, G=2, T=3).
+/// Last byte stores the remainder count in its low 2 bits (0 = sentinel, bases in prev bytes only).
+/// IUPAC ambiguous bases are encoded as A in the packed stream and listed in the ambig_data section.
+fn encode_nucleotide_seq(seq: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    // Collect ambiguity runs: (start_pos, length_minus_1, na4_code)
+    let mut segs: Vec<(u32, u32, u8)> = Vec::new();
+    let mut i = 0;
+    while i < seq.len() {
+        let na4 = iupac_to_na4(seq[i].to_ascii_uppercase());
+        if !matches!(na4, 1 | 2 | 4 | 8) {
+            // ambiguous base — collect run of identical na4
+            let start = i;
+            let code  = na4;
+            let mut j = i + 1;
+            while j < seq.len() && iupac_to_na4(seq[j].to_ascii_uppercase()) == code {
+                j += 1;
+            }
+            segs.push((start as u32, (j - start - 1) as u32, code));
+            i = j;
+        } else {
+            i += 1;
+        }
+    }
+
+    let packed = pack_na2(seq);
+
+    let ambig = if segs.is_empty() {
+        Vec::new()
+    } else {
+        let mut data: Vec<u8> = Vec::new();
+        // num_segments with high bit set → new (8-byte) format
+        let n = (segs.len() as u32) | 0x8000_0000;
+        data.write_u32::<BigEndian>(n).unwrap();
+        for (start, len_m1, na4) in &segs {
+            // bits 63-60: na4 code, bits 59-48: length-1, bits 47-32: 0, bits 31-0: start
+            let val: u64 = ((*na4 as u64) << 60)
+                | ((*len_m1 as u64 & 0xfff) << 48)
+                | (*start as u64 & 0xffff_ffff);
+            data.write_u64::<BigEndian>(val).unwrap();
+        }
+        data
+    };
+
+    (packed, ambig)
+}
+
+fn pack_na2(seq: &[u8]) -> Vec<u8> {
+    let n = seq.len();
+    if n == 0 {
+        return vec![0x00]; // sentinel
+    }
+    let num_full = n / 4;
+    let remainder = n % 4;
+    let mut out = Vec::with_capacity(num_full + 1);
+
+    for i in 0..num_full {
+        let mut byte = 0u8;
+        for j in 0..4usize {
+            byte |= base_to_2bit(seq[i * 4 + j].to_ascii_uppercase()) << ((3 - j) * 2);
+        }
+        out.push(byte);
+    }
+
+    if remainder == 0 {
+        out.push(0x00); // sentinel: 0 extra bases
+    } else {
+        // Pack `remainder` bases in high bits; store count in low 2 bits.
+        let mut byte = remainder as u8;
+        for j in 0..remainder {
+            byte |= base_to_2bit(seq[num_full * 4 + j].to_ascii_uppercase()) << ((3 - j) * 2);
+        }
+        out.push(byte);
+    }
+
+    out
+}
+
+fn base_to_2bit(c: u8) -> u8 {
+    match c { b'C' => 1, b'G' => 2, b'T' | b'U' => 3, _ => 0 }
+}
+
+/// Map an uppercase IUPAC character to a 4-bit NA4 code (bit per base: A=1,C=2,G=4,T=8).
+fn iupac_to_na4(c: u8) -> u8 {
+    match c {
+        b'A' => 0x1, b'C' => 0x2, b'G' => 0x4, b'T' | b'U' => 0x8,
+        b'M' => 0x3, b'R' => 0x5, b'S' => 0x6, b'V' => 0x7,
+        b'W' => 0x9, b'Y' => 0xa, b'H' => 0xb, b'K' => 0xc,
+        b'D' => 0xd, b'B' => 0xe, b'N' => 0xf,
+        _    => 0xf, // treat unknown as N
+    }
+}
+
+// ─── BER encoding ────────────────────────────────────────────────────────────
+
+fn ber_length(len: usize) -> Vec<u8> {
+    if len < 128 {
+        vec![len as u8]
+    } else {
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut n = len;
+        while n > 0 { bytes.push((n & 0xff) as u8); n >>= 8; }
+        bytes.reverse();
+        let mut out = vec![0x80 | bytes.len() as u8];
+        out.extend_from_slice(&bytes);
+        out
+    }
+}
+
+fn ber_tlv(tag: u8, content: &[u8]) -> Vec<u8> {
+    let mut out = vec![tag];
+    out.extend(ber_length(content.len()));
+    out.extend_from_slice(content);
+    out
+}
+
+fn ber_visible_string(s: &str) -> Vec<u8> {
+    ber_tlv(0x1a, s.as_bytes())
+}
+
+/// Minimal two's-complement BER INTEGER encoding.
+fn ber_integer(n: i64) -> Vec<u8> {
+    if n == 0 {
+        return ber_tlv(0x02, &[0x00]);
+    }
+    let raw = n.to_be_bytes();
+    // Strip redundant leading bytes
+    let mut start = 0;
+    while start < 7 {
+        let b    = raw[start];
+        let next = raw[start + 1];
+        if (n >= 0 && b == 0x00 && next & 0x80 == 0)
+        || (n <  0 && b == 0xff && next & 0x80 != 0)
+        {
+            start += 1;
+        } else {
+            break;
+        }
+    }
+    ber_tlv(0x02, &raw[start..])
+}
+
+/// Encode one sequence as a complete BER Blast-def-line-set (SEQUENCE OF one Blast-def-line).
+///
+/// Structure written:
+/// ```text
+/// SEQUENCE (0x30)                    ← Blast-def-line-set
+///   SEQUENCE (0x30)                  ← Blast-def-line
+///     [0] EXPLICIT (0xa0)            ← title
+///       VisibleString (0x1a) title
+///     [1] EXPLICIT (0xa1)            ← seqid (Seq-id TLVs directly, no SEQUENCE OF wrapper)
+///       [0] context (0xa0)           ← local Object-id
+///         VisibleString (0x1a) accession
+///     [2] EXPLICIT (0xa2)  [opt]     ← taxid
+///       INTEGER (0x02) taxid
+/// ```
+pub fn encode_defline_ber(title: &str, accession: &str, taxid: Option<u32>) -> Vec<u8> {
+    let title_field = ber_tlv(0xa0, &ber_visible_string(title));
+
+    // The parser iterates Seq-id TLVs directly inside [1] (no SEQUENCE OF wrapper).
+    let seq_id      = ber_tlv(0xa0, &ber_visible_string(accession)); // local Object-id (str)
+    let seqid_field = ber_tlv(0xa1, &seq_id);
+
+    let taxid_field = taxid
+        .map(|t| ber_tlv(0xa2, &ber_integer(t as i64)))
+        .unwrap_or_default();
+
+    let mut defline_content = Vec::new();
+    defline_content.extend_from_slice(&title_field);
+    defline_content.extend_from_slice(&seqid_field);
+    defline_content.extend_from_slice(&taxid_field);
+
+    let defline = ber_tlv(0x30, &defline_content);
+    ber_tlv(0x30, &defline) // Blast-def-line-set
+}

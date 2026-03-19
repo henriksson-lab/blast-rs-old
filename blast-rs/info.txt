@@ -1,0 +1,34 @@
+                                                                                                                                                      │
+│ What is NOT in scope (initial version)                                                                                                                                                                │
+│                                                                                                                                                                                                       │
+│ - BLASTX, TBLASTN, TBLASTX (translated searches)                                                                                                                                                      │
+│ - PSI-BLAST / PSSM                                                                                                                                                                                    │
+│ - BlastDB version 5 (LMDB-based)                                                                                                                                                                      │
+│ - Remote BLAST                                                                                                                                                                                        │
+│ - Composition-based statistics adjustment                                                                                                                                                             │
+│ - Masking (DUST, SEG) — accept unmasked input      
+
+                                                                                                                                                                                      
+  What's implemented (all milestones M1–M9)                                                                                                                                                              
+                                                                                                                                                                                                         
+  blast-db:                                                                                                                                                                                              
+  - Index parser (.nin/.pin) — big-endian fields, little-endian volume-length                                                                                                                          
+  - Protein decoder (Ncbistdaa → ASCII)                                                                                                                                                                  
+  - Nucleotide decoder (NcbiNa2 packed + old/new ambiguity format)                                                                                                                                     
+  - Minimal BER decoder for Blast-def-line-set (title, accession, taxid)                                                                                                                                 
+  - Memory-mapped sequence + header files via memmap2                                                                                                                                                    
+                                                                                                                                                                                                         
+  blast-core:                                                                                                                                                                                            
+  - BLOSUM45/62/80, PAM30/70/250 scoring matrices (Ncbistdaa-indexed)                                                                                                                                    
+  - Karlin-Altschul statistics with pre-computed λ/K/H tables for all matrix+gap combos                                                                                                                  
+  - Protein lookup with neighbor word enumeration (word_size=3, T=11)                  
+  - Nucleotide lookup (word_size=11, 2-bit packed)                                                                                                                                                       
+  - Ungapped X-drop extension (protein + nucleotide)                                                                                                                                                     
+  - Affine gap DP with X-drop and traceback                                                                                                                                                              
+  - Full search pipeline with rayon parallelism                                                                                                                                                          
+                                                                                                                                                                                                         
+  blast-cli:                                                                                                                                                                                             
+  - blastp / blastn subcommands with all standard flags                                                                                                                                                  
+  - Output format 0 (pairwise) and 6 (tabular)                                                                                                                                                           
+  - dumpdb for testing/verification                         
+
