@@ -9,8 +9,9 @@ use blast_db::index::SeqType;
 use blast_core::{
     SearchParams,
     matrix::MatrixType,
-    search::{blast_search, blastn_search, blastx_search, tblastn_search, tblastx_search},
-    pssm::psiblast_search,
+    api::{blastp as api_blastp, blastn as api_blastn, blastx as api_blastx,
+          tblastn as api_tblastn, tblastx as api_tblastx,
+          psiblast as api_psiblast, PsiblastParams},
 };
 
 #[derive(Parser)]
@@ -242,8 +243,7 @@ fn run_blastp(args: &BlastArgs) {
     }
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        let query_ncbistdaa = aa_to_ncbistdaa(query_seq);
-        let results = blast_search(&db, &query_ncbistdaa, &params);
+        let results = api_blastp(&db, query_seq, &params);
 
         let ctx = output::SearchContext {
             program: "blastp",
@@ -323,7 +323,7 @@ fn run_blastn(args: &BlastArgs) {
     }
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        let results = blastn_search(&db, query_seq, &params);
+        let results = api_blastn(&db, query_seq, &params);
 
         let ctx = output::SearchContext {
             program: "blastn",
@@ -419,7 +419,7 @@ fn run_blastx(args: &BlastArgs) {
     else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        let results = blastx_search(&db, query_seq, &params);
+        let results = api_blastx(&db, query_seq, &params);
         let ctx = output::SearchContext {
             program: "blastx", db_path: &db_path, db_title: &db_title,
             db_num_seqs, db_len, query_title,
@@ -468,7 +468,7 @@ fn run_tblastn(args: &BlastArgs) {
     else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        let results = tblastn_search(&db, query_seq, &params);
+        let results = api_tblastn(&db, query_seq, &params);
         let ctx = output::SearchContext {
             program: "tblastn", db_path: &db_path, db_title: &db_title,
             db_num_seqs, db_len, query_title,
@@ -512,7 +512,7 @@ fn run_tblastx(args: &BlastArgs) {
     else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        let results = tblastx_search(&db, query_seq, &params);
+        let results = api_tblastx(&db, query_seq, &params);
         let ctx = output::SearchContext {
             program: "tblastx", db_path: &db_path, db_title: &db_title,
             db_num_seqs, db_len, query_title,
@@ -557,11 +557,12 @@ fn run_psiblast(args: &PsiblastArgs) {
     if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "psiblast", &db_path, "blast-cli 0.1.0").unwrap(); }
     else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
+    let psi_params = PsiblastParams::new(params.clone())
+        .num_iterations(args.num_iterations)
+        .inclusion_evalue(args.inclusion_ethresh);
+
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        let query_ncbi = aa_to_ncbistdaa(query_seq);
-        let (results, _pssm) = psiblast_search(
-            &db, &query_ncbi, &params, args.num_iterations, args.inclusion_ethresh,
-        );
+        let (results, _pssm) = api_psiblast(&db, query_seq, &psi_params);
         let ctx = output::SearchContext {
             program: "psiblast", db_path: &db_path, db_title: &db_title,
             db_num_seqs, db_len, query_title,
@@ -755,46 +756,3 @@ fn read_fasta(path: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
     Ok(sequences)
 }
 
-// ---- Encoding converters ----
-
-/// Convert ASCII amino acid sequence to Ncbistdaa encoding.
-/// Inverse of NCBISTDAA_TO_AA table.
-fn aa_to_ncbistdaa(seq: &[u8]) -> Vec<u8> {
-    seq.iter().map(|&c| ascii_to_ncbistdaa(c)).collect()
-}
-
-/// Convert a single ASCII amino acid character to its Ncbistdaa code.
-fn ascii_to_ncbistdaa(c: u8) -> u8 {
-    // Ncbistdaa: - A B C D E F G H I K L M N P Q R S T V W X Y Z U * O J
-    //             0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27
-    match c.to_ascii_uppercase() {
-        b'A' => 1,
-        b'B' => 2,
-        b'C' => 3,
-        b'D' => 4,
-        b'E' => 5,
-        b'F' => 6,
-        b'G' => 7,
-        b'H' => 8,
-        b'I' => 9,
-        b'K' => 10,
-        b'L' => 11,
-        b'M' => 12,
-        b'N' => 13,
-        b'P' => 14,
-        b'Q' => 15,
-        b'R' => 16,
-        b'S' => 17,
-        b'T' => 18,
-        b'V' => 19,
-        b'W' => 20,
-        b'X' => 21,
-        b'Y' => 22,
-        b'Z' => 23,
-        b'U' => 24,
-        b'*' => 25,
-        b'O' => 26,
-        b'J' => 27,
-        _ => 21, // X = unknown
-    }
-}

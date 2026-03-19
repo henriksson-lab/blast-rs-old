@@ -88,6 +88,31 @@ impl SearchParams {
         p.gap_open = 0; p.gap_extend = 0; // TBLASTX is ungapped
         p
     }
+
+    /// Short alias for [`blastp_defaults`](Self::blastp_defaults).
+    pub fn blastp() -> Self { Self::blastp_defaults() }
+    /// Short alias for [`blastn_defaults`](Self::blastn_defaults).
+    pub fn blastn() -> Self { Self::blastn_defaults() }
+    /// Short alias for [`blastx_defaults`](Self::blastx_defaults).
+    pub fn blastx() -> Self { Self::blastx_defaults() }
+    /// Short alias for [`tblastn_defaults`](Self::tblastn_defaults).
+    pub fn tblastn() -> Self { Self::tblastn_defaults() }
+    /// Short alias for [`tblastx_defaults`](Self::tblastx_defaults).
+    pub fn tblastx() -> Self { Self::tblastx_defaults() }
+
+    // ── Builder setters ──────────────────────────────────────────────────────
+
+    pub fn evalue(mut self, v: f64) -> Self { self.evalue_threshold = v; self }
+    pub fn max_target_seqs(mut self, v: usize) -> Self { self.max_target_seqs = v; self }
+    pub fn matrix(mut self, v: MatrixType) -> Self { self.matrix = v; self }
+    pub fn num_threads(mut self, v: usize) -> Self { self.num_threads = v; self }
+    pub fn word_size(mut self, v: usize) -> Self { self.word_size = v; self }
+    pub fn gap_open(mut self, v: i32) -> Self { self.gap_open = v; self }
+    pub fn gap_extend(mut self, v: i32) -> Self { self.gap_extend = v; self }
+    pub fn filter_low_complexity(mut self, v: bool) -> Self { self.filter_low_complexity = v; self }
+    pub fn comp_adjust(mut self, v: bool) -> Self { self.comp_adjust = v; self }
+    pub fn match_score(mut self, v: i32) -> Self { self.match_score = v; self }
+    pub fn mismatch(mut self, v: i32) -> Self { self.mismatch = v; self }
 }
 
 /// Neighbor word score threshold for protein lookup.
@@ -448,7 +473,7 @@ fn build_nt_matrix(match_score: i32, mismatch: i32) -> ScoringMatrix {
 
 // ─── Helper: ascii amino acid → Ncbistdaa ────────────────────────────────────
 
-fn aa_to_ncbistdaa(seq: &[u8]) -> Vec<u8> {
+pub(crate) fn aa_to_ncbistdaa(seq: &[u8]) -> Vec<u8> {
     seq.iter().map(|&c| match c.to_ascii_uppercase() {
         b'A' => 1,  b'B' => 2,  b'C' => 3,  b'D' => 4,  b'E' => 5,
         b'F' => 6,  b'G' => 7,  b'H' => 8,  b'I' => 9,  b'K' => 10,

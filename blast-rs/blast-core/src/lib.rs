@@ -10,6 +10,7 @@ pub mod translate;
 pub mod mask;
 pub mod pssm;
 pub mod compo;
+pub mod api;
 
 pub use matrix::{ScoringMatrix, MatrixType};
 pub use stats::KarlinAltschul;
@@ -19,3 +20,12 @@ pub use translate::{six_frame_translate, reverse_complement, TranslatedFrame};
 pub use mask::{apply_dust, apply_seg, apply_seg_ncbistdaa};
 pub use pssm::{Pssm, build_pssm, psiblast_search, search_with_pssm};
 pub use compo::{composition_ncbistdaa, adjust_evalue, BACKGROUND_FREQ};
+
+// Top-level API functions
+pub use api::{blastp, blastn, blastx, tblastn, tblastx, psiblast, PsiblastParams, parse_fasta};
+
+// Low-level search functions for advanced users
+pub use search::{blastn_search, blastx_search, tblastn_search, tblastx_search};
+
+// Re-export BlastDb types so users need only one dependency
+pub use blast_db::{BlastDb, BlastDefLine, BlastDbBuilder, SequenceEntry};
