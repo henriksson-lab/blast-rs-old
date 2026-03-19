@@ -1,10 +1,13 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::fs;
 use memmap2::Mmap;
 use crate::error::{DbError, Result};
 use crate::index::{IndexFile, SeqType};
 use crate::header::{BlastDefLine, parse_def_line_set};
 use crate::sequence::{get_protein_raw, get_nucleotide, decode_protein};
+use crate::lmdb_v5::LmdbV5;
+use crate::oid_seqids::OidSeqIds;
+use crate::oid_taxids::OidTaxIds;
 
 pub struct BlastDb {
     pub(crate) index: IndexFile,
@@ -12,39 +15,75 @@ pub struct BlastDb {
     seq_mmap: Mmap,
     /// Memory-mapped header file (.phr or .nhr)
     hdr_mmap: Mmap,
+    /// V5 LMDB accession index (.pdb or .ndb) — None for v4 databases.
+    lmdb: Option<LmdbV5>,
+    /// V5 OID→SeqIds file (.pos or .nos) — None for v4 databases.
+    oid_seqids: Option<OidSeqIds>,
+    /// V5 OID→TaxIds file (.pot or .not) — None for v4 databases.
+    oid_taxids: Option<OidTaxIds>,
 }
 
 impl BlastDb {
     /// Open a BLAST database by base path (without extension).
-    /// Detects whether it's protein or nucleotide from available files.
+    /// Auto-detects protein vs nucleotide and v4 vs v5.
     pub fn open(path: &Path) -> Result<Self> {
-        // Try protein first, then nucleotide
-        let (index_ext, seq_ext, hdr_ext) = if path.with_extension("pin").exists() {
-            ("pin", "psq", "phr")
+        // Detect type by which index file exists.
+        let (is_protein, index_ext, seq_ext, hdr_ext) = if path.with_extension("pin").exists() {
+            (true, "pin", "psq", "phr")
         } else if path.with_extension("nin").exists() {
-            ("nin", "nsq", "nhr")
+            (false, "nin", "nsq", "nhr")
         } else {
             return Err(DbError::InvalidFormat(format!(
-                "No .pin or .nin file found at {}",
+                "No .pin or .nin index file found at {}",
                 path.display()
             )));
         };
 
-        let index_path = path.with_extension(index_ext);
-        let seq_path = path.with_extension(seq_ext);
-        let hdr_path = path.with_extension(hdr_ext);
-
-        let index_data = fs::read(&index_path)?;
+        let index_data = fs::read(path.with_extension(index_ext))?;
         let index = IndexFile::parse(&index_data)?;
 
-        let seq_file = fs::File::open(&seq_path)?;
+        let seq_file = fs::File::open(path.with_extension(seq_ext))?;
         let seq_mmap = unsafe { Mmap::map(&seq_file)? };
 
-        let hdr_file = fs::File::open(&hdr_path)?;
+        let hdr_file = fs::File::open(path.with_extension(hdr_ext))?;
         let hdr_mmap = unsafe { Mmap::map(&hdr_file)? };
 
-        Ok(BlastDb { index, seq_mmap, hdr_mmap })
+        // V5: try to open LMDB and auxiliary files (gracefully absent = v4).
+        let (lmdb, oid_seqids, oid_taxids) = if index.format_version == 5 {
+            let (lmdb_ext, seqids_ext, taxids_ext) =
+                if is_protein { ("pdb", "pos", "pot") }
+                else          { ("ndb", "nos", "not") };
+
+            let lmdb_path = path.with_extension(lmdb_ext);
+            let lmdb = if lmdb_path.exists() {
+                Some(LmdbV5::open(&lmdb_path)?)
+            } else {
+                None
+            };
+
+            let oid_seqids_path = path.with_extension(seqids_ext);
+            let oid_seqids = if oid_seqids_path.exists() {
+                Some(OidSeqIds::open(&oid_seqids_path)?)
+            } else {
+                None
+            };
+
+            let oid_taxids_path = path.with_extension(taxids_ext);
+            let oid_taxids = if oid_taxids_path.exists() {
+                Some(OidTaxIds::open(&oid_taxids_path)?)
+            } else {
+                None
+            };
+
+            (lmdb, oid_seqids, oid_taxids)
+        } else {
+            (None, None, None)
+        };
+
+        Ok(BlastDb { index, seq_mmap, hdr_mmap, lmdb, oid_seqids, oid_taxids })
     }
+
+    // ---- Metadata ----
 
     pub fn num_sequences(&self) -> u32 {
         self.index.num_oids
@@ -61,6 +100,18 @@ impl BlastDb {
     pub fn title(&self) -> &str {
         &self.index.title
     }
+
+    /// Returns 4 for classic BlastDB, 5 for LMDB-indexed BlastDB.
+    pub fn format_version(&self) -> i32 {
+        self.index.format_version
+    }
+
+    /// Returns true if this is a v5 database with an LMDB accession index.
+    pub fn is_v5(&self) -> bool {
+        self.index.format_version == 5
+    }
+
+    // ---- Sequence access ----
 
     /// Returns raw Ncbistdaa bytes for a protein sequence.
     pub fn get_sequence_protein_raw(&self, oid: u32) -> Result<&[u8]> {
@@ -87,7 +138,9 @@ impl BlastDb {
         Ok(get_nucleotide(&self.seq_mmap, seq_start, seq_end, ambig_start, ambig_end))
     }
 
-    /// Returns the primary defline for an OID.
+    // ---- Header access ----
+
+    /// Returns the primary defline for an OID (from the BER-encoded .phr/.nhr file).
     pub fn get_header(&self, oid: u32) -> Result<BlastDefLine> {
         self.check_oid(oid)?;
         let start = self.index.header_array[oid as usize] as usize;
@@ -105,6 +158,53 @@ impl BlastDb {
         let data = &self.hdr_mmap[start..end];
         parse_def_line_set(data)
     }
+
+    // ---- V5 accession index ----
+
+    /// Find OID(s) for an accession string using the LMDB index.
+    /// Returns `None` if this is a v4 database (no LMDB index).
+    /// Returns an empty `Vec` if the accession is not found.
+    pub fn lookup_accession(&self, accession: &str) -> Option<Result<Vec<u32>>> {
+        let lmdb = self.lmdb.as_ref()?;
+        Some(lmdb.get_oids_for_accession(accession))
+    }
+
+    /// Iterate over all (accession, oid) pairs in the LMDB index.
+    /// Returns `None` if this is a v4 database.
+    pub fn iter_accessions<F>(&self, f: F) -> Option<Result<()>>
+    where
+        F: FnMut(&str, u32),
+    {
+        let lmdb = self.lmdb.as_ref()?;
+        Some(lmdb.iter_accessions(f))
+    }
+
+    /// Get volume name → num_oids information from the LMDB.
+    /// Returns `None` for v4 databases.
+    pub fn get_volumes_info(&self) -> Option<Result<Vec<(String, u32)>>> {
+        let lmdb = self.lmdb.as_ref()?;
+        Some(lmdb.get_volumes_info())
+    }
+
+    // ---- V5 OID→SeqIDs ----
+
+    /// Return all seq-id strings for an OID from the `.pos`/`.nos` file.
+    /// Returns `None` if the file is not available (v4 or absent).
+    pub fn get_seqids(&self, oid: u32) -> Option<Result<Vec<String>>> {
+        let r = self.oid_seqids.as_ref()?;
+        Some(r.get_seqids(oid))
+    }
+
+    // ---- V5 OID→TaxIDs ----
+
+    /// Return all tax IDs for an OID from the `.pot`/`.not` file.
+    /// Returns `None` if the file is not available (v4 or absent).
+    pub fn get_taxids(&self, oid: u32) -> Option<Result<Vec<i32>>> {
+        let r = self.oid_taxids.as_ref()?;
+        Some(r.get_taxids(oid))
+    }
+
+    // ---- Internal ----
 
     fn check_oid(&self, oid: u32) -> Result<()> {
         if oid >= self.index.num_oids {

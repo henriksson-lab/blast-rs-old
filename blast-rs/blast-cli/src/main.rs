@@ -77,9 +77,18 @@ struct DumpArgs {
     /// Max sequences to dump (0 = all)
     #[arg(long, default_value = "0")]
     max: usize,
-    /// Show headers only
+    /// Show headers only (no sequences)
     #[arg(long)]
     headers_only: bool,
+    /// List all accessions from the v5 LMDB index
+    #[arg(long)]
+    list_accessions: bool,
+    /// Look up OIDs for a specific accession (v5 only)
+    #[arg(long)]
+    lookup: Option<String>,
+    /// Show v5 volume info from LMDB
+    #[arg(long)]
+    volumes: bool,
 }
 
 fn main() {
@@ -189,30 +198,90 @@ fn run_dumpdb(args: &DumpArgs) {
         std::process::exit(1);
     });
 
-    let n = if args.max == 0 { db.num_sequences() } else { args.max as u32 };
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
 
+    // v5: accession lookup
+    if let Some(acc) = &args.lookup {
+        match db.lookup_accession(acc) {
+            None => eprintln!("Database is v4 (no LMDB accession index)."),
+            Some(Err(e)) => eprintln!("Lookup error: {}", e),
+            Some(Ok(oids)) => {
+                if oids.is_empty() {
+                    writeln!(out, "Accession '{}' not found.", acc).unwrap();
+                } else {
+                    for oid in oids {
+                        writeln!(out, "{}\t{}", acc, oid).unwrap();
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // v5: list volume info
+    if args.volumes {
+        match db.get_volumes_info() {
+            None => eprintln!("Database is v4 (no LMDB volume info)."),
+            Some(Err(e)) => eprintln!("Volume info error: {}", e),
+            Some(Ok(vols)) => {
+                writeln!(out, "DB version: {}", db.format_version()).unwrap();
+                writeln!(out, "Volumes ({}):", vols.len()).unwrap();
+                for (name, n_oids) in &vols {
+                    writeln!(out, "  {} ({} OIDs)", name, n_oids).unwrap();
+                }
+            }
+        }
+        return;
+    }
+
+    // v5: list all accessions
+    if args.list_accessions {
+        match db.iter_accessions(|acc, oid| {
+            writeln!(out, "{}\t{}", acc, oid).ok();
+        }) {
+            None => eprintln!("Database is v4 (no LMDB accession index)."),
+            Some(Err(e)) => eprintln!("Iteration error: {}", e),
+            Some(Ok(())) => {}
+        }
+        return;
+    }
+
+    // Standard sequence dump
+    let n = if args.max == 0 { db.num_sequences() } else { args.max as u32 };
+
     for oid in 0..n {
         let header = db.get_header(oid).unwrap_or_default();
-        let title = if header.title.is_empty() { format!("OID={}", oid) } else { header.title.clone() };
+
+        // For v5, prefer the .pos/.nos seqid list for the defline.
+        let accession = if let Some(Ok(ids)) = db.get_seqids(oid) {
+            ids.into_iter().next().unwrap_or_else(|| header.accession.clone())
+        } else {
+            header.accession.clone()
+        };
+
+        let title = if header.title.is_empty() {
+            format!("OID={}", oid)
+        } else {
+            header.title.clone()
+        };
 
         if args.headers_only {
-            writeln!(out, ">{} [accession={}] [taxid={}]", title, header.accession, header.taxid).unwrap();
+            writeln!(out, ">{} {} [taxid={}]", accession, title, header.taxid).unwrap();
             continue;
         }
 
         match db.seq_type() {
             blast_db::index::SeqType::Protein => {
                 let seq = db.get_sequence_protein(oid).unwrap_or_default();
-                writeln!(out, ">{} {}", header.accession, title).unwrap();
+                writeln!(out, ">{} {}", accession, title).unwrap();
                 for chunk in seq.chunks(60) {
                     writeln!(out, "{}", std::str::from_utf8(chunk).unwrap_or("?")).unwrap();
                 }
             }
             blast_db::index::SeqType::Nucleotide => {
                 let seq = db.get_sequence_nucleotide(oid).unwrap_or_default();
-                writeln!(out, ">{} {}", header.accession, title).unwrap();
+                writeln!(out, ">{} {}", accession, title).unwrap();
                 for chunk in seq.chunks(60) {
                     writeln!(out, "{}", std::str::from_utf8(chunk).unwrap_or("?")).unwrap();
                 }

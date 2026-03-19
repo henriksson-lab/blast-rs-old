@@ -10,6 +10,7 @@ pub enum SeqType {
 
 #[derive(Debug)]
 pub struct IndexFile {
+    pub format_version: i32,
     pub seq_type: SeqType,
     pub title: String,
     pub create_date: String,
@@ -40,7 +41,7 @@ impl IndexFile {
         let mut cur = Cursor::new(data);
 
         let version = cur.read_i32::<BigEndian>()?;
-        if version != 4 {
+        if version != 4 && version != 5 {
             return Err(DbError::UnsupportedVersion(version));
         }
 
@@ -81,6 +82,7 @@ impl IndexFile {
         };
 
         Ok(IndexFile {
+            format_version: version,
             seq_type,
             title,
             create_date,
