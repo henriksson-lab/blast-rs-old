@@ -23,6 +23,116 @@ blast-rs/
   blast-cli/    binary: blast-cli (blastp, blastn, makeblastdb, dumpdb)
 ```
 
+## Using blast-core as a library
+
+`blast-core` exposes a high-level Rust API so you can embed BLAST searches in your own program without shelling out to the CLI.
+
+Add to `Cargo.toml`:
+
+```toml
+[dependencies]
+blast-core = { path = "blast-rs/blast-core" }
+```
+
+### Protein search (blastp)
+
+```rust
+use blast_core::{BlastDb, SearchParams, blastp, parse_fasta};
+
+fn main() -> anyhow::Result<()> {
+    let db = BlastDb::open("mydb".as_ref())?;
+
+    let fasta = std::fs::read("query.faa")?;
+    let sequences = parse_fasta(&fasta);
+
+    let params = SearchParams::blastp()
+        .evalue(1e-5)
+        .max_target_seqs(50)
+        .num_threads(8);
+
+    for (title, seq) in &sequences {
+        let results = blastp(&db, seq, &params);
+        for r in &results {
+            println!("{}\t{}\t{:.2e}", title, r.subject_accession, r.best_evalue());
+        }
+    }
+    Ok(())
+}
+```
+
+### Nucleotide search (blastn)
+
+```rust
+use blast_core::{BlastDb, SearchParams, blastn};
+
+let db = BlastDb::open("nt".as_ref())?;
+let params = SearchParams::blastn()
+    .evalue(1e-10)
+    .word_size(15)
+    .match_score(2)
+    .mismatch(-3);
+
+let results = blastn(&db, b"ATGCGTACGTAGCTAGC", &params);
+```
+
+### Translated search (blastx / tblastn / tblastx)
+
+```rust
+use blast_core::{BlastDb, SearchParams, blastx, tblastn, tblastx};
+
+// Nucleotide query vs protein database (6-frame translation of query)
+let results = blastx(&db, nt_query, &SearchParams::blastx().evalue(1e-5));
+
+// Protein query vs nucleotide database (6-frame translation of subjects)
+let results = tblastn(&db, aa_query, &SearchParams::tblastn().evalue(1e-5));
+
+// Both sides translated (expensive)
+let results = tblastx(&db, nt_query, &SearchParams::tblastx());
+```
+
+### Iterative search with PSSM (psiblast)
+
+```rust
+use blast_core::{BlastDb, SearchParams, psiblast, PsiblastParams};
+
+let db = BlastDb::open("mydb".as_ref())?;
+let search = SearchParams::blastp().evalue(10.0).matrix(blast_core::MatrixType::Blosum62);
+
+let params = PsiblastParams::new(search)
+    .num_iterations(3)
+    .inclusion_evalue(0.001);
+
+let (results, pssm) = psiblast(&db, b"MKTLLLTLVV...", &params);
+// `pssm` can be used for subsequent custom searches via `blast_core::search_with_pssm`
+```
+
+### Parsing FASTA in memory
+
+```rust
+use blast_core::parse_fasta;
+
+let input = std::fs::read("sequences.faa")?;
+for (title, seq) in parse_fasta(&input) {
+    println!("{}: {} residues", title, seq.len());
+}
+```
+
+### SearchParams builder reference
+
+| Method | Type | Description |
+|--------|------|-------------|
+| `.evalue(f64)` | all | E-value threshold (default 10.0) |
+| `.max_target_seqs(usize)` | all | Max hits returned (default 500) |
+| `.num_threads(usize)` | all | Worker threads; 0 = all (default 0) |
+| `.word_size(usize)` | all | Seed word length |
+| `.gap_open(i32)` | protein | Gap open penalty |
+| `.gap_extend(i32)` | protein | Gap extend penalty |
+| `.matrix(MatrixType)` | protein | Scoring matrix |
+| `.filter_low_complexity(bool)` | all | SEG/DUST masking (default true) |
+| `.comp_adjust(bool)` | protein | Composition-based statistics (default true) |
+| `.match_score(i32)` | blastn | Match reward (default 2) |
+| `.mismatch(i32)` | blastn | Mismatch penalty (default -3) |
+
 ## Building
 
 Requires Rust 1.70+ and a system LMDB library (for v5 database support).
