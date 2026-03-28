@@ -4,9 +4,9 @@ use std::path::{Path, PathBuf};
 use std::fs;
 use std::io::{self, BufRead, Write};
 use clap::{Parser, Subcommand};
-use blast_db::{BlastDb, BlastDbBuilder, SequenceEntry};
-use blast_db::index::SeqType;
-use blast_core::{
+use blast_rs::{BlastDb, BlastDbBuilder, SequenceEntry};
+use blast_rs::db::index::SeqType;
+use blast_rs::{
     SearchParams,
     matrix::MatrixType,
     api::{blastp as api_blastp, blastn as api_blastn, blastx as api_blastx,
@@ -41,6 +41,8 @@ enum Commands {
     Makeblastdb(MakeDbArgs),
     /// Retrieve sequences or information from a BLAST database
     Blastdbcmd(BlastdbcmdArgs),
+    /// Create a BLAST database alias
+    BlastdbAliastool(AliasArgs),
 }
 
 #[derive(clap::Args)]
@@ -148,6 +150,27 @@ struct BlastArgs {
     /// Window size for 2-hit algorithm
     #[arg(long = "window_size")]
     window_size: Option<usize>,
+    /// GI list file to restrict search
+    #[arg(long)]
+    gilist: Option<PathBuf>,
+    /// Negative GI list file to exclude from search
+    #[arg(long)]
+    negative_gilist: Option<PathBuf>,
+    /// Produce HTML output
+    #[arg(long)]
+    html: bool,
+    /// Export search strategy to file
+    #[arg(long = "export_search_strategy")]
+    export_strategy: Option<PathBuf>,
+    /// Import search strategy from file
+    #[arg(long = "import_search_strategy")]
+    import_strategy: Option<PathBuf>,
+    /// Discontiguous megablast template type (0=coding, 1=optimal)
+    #[arg(long = "template_type")]
+    template_type: Option<u8>,
+    /// Discontiguous megablast template length (18 or 21)
+    #[arg(long = "template_length")]
+    template_length: Option<usize>,
 }
 
 #[derive(clap::Args)]
@@ -263,6 +286,25 @@ struct MakeDbArgs {
     /// Parse FASTA headers as "accession description" (first word = accession)
     #[arg(long, default_value = "true")]
     parse_seqids: bool,
+    /// Database format version (4 or 5)
+    #[arg(long, default_value = "4")]
+    dbversion: u32,
+}
+
+#[derive(clap::Args)]
+struct AliasArgs {
+    /// List of database paths to combine (space-separated)
+    #[arg(long)]
+    dblist: String,
+    /// Output alias file path (without extension)
+    #[arg(short, long)]
+    out: PathBuf,
+    /// Database type: prot or nucl
+    #[arg(long, default_value = "prot")]
+    dbtype: String,
+    /// Title for the alias database
+    #[arg(long)]
+    title: Option<String>,
 }
 
 fn main() {
@@ -277,6 +319,7 @@ fn main() {
         Commands::Dumpdb(args)      => run_dumpdb(args),
         Commands::Makeblastdb(args) => run_makeblastdb(args),
         Commands::Blastdbcmd(args)  => run_blastdbcmd(args),
+        Commands::BlastdbAliastool(args) => run_aliastool(args),
     }
 }
 
@@ -322,6 +365,27 @@ fn apply_task_preset(params: &mut SearchParams, task: &str, program: &str) {
 fn build_oid_filter(db: &BlastDb, args: &BlastArgs) -> Option<std::collections::HashSet<u32>> {
     use std::collections::HashSet;
 
+    // Collect GI list filter
+    let gi_filter: Option<HashSet<i64>> = if let Some(ref gi_file) = args.gilist {
+        let content = fs::read_to_string(gi_file).unwrap_or_else(|e| {
+            eprintln!("Error reading gilist: {}", e);
+            std::process::exit(1);
+        });
+        Some(content.lines().filter_map(|l| l.trim().parse().ok()).collect())
+    } else {
+        None
+    };
+
+    let neg_gi_filter: Option<HashSet<i64>> = if let Some(ref gi_file) = args.negative_gilist {
+        let content = fs::read_to_string(gi_file).unwrap_or_else(|e| {
+            eprintln!("Error reading negative_gilist: {}", e);
+            std::process::exit(1);
+        });
+        Some(content.lines().filter_map(|l| l.trim().parse().ok()).collect())
+    } else {
+        None
+    };
+
     // Collect taxid filter
     let tax_filter: Option<HashSet<u32>> = if let Some(ref taxids_str) = args.taxids {
         Some(taxids_str.split(',').filter_map(|s| s.trim().parse().ok()).collect())
@@ -357,7 +421,9 @@ fn build_oid_filter(db: &BlastDb, args: &BlastArgs) -> Option<std::collections::
         None
     };
 
-    if tax_filter.is_none() && seqid_filter.is_none() && neg_seqid_filter.is_none() {
+    if tax_filter.is_none() && seqid_filter.is_none() && neg_seqid_filter.is_none()
+        && gi_filter.is_none() && neg_gi_filter.is_none()
+    {
         return None;
     }
 
@@ -401,6 +467,32 @@ fn build_oid_filter(db: &BlastDb, args: &BlastArgs) -> Option<std::collections::
                 if let Ok(header) = db.get_header(oid) {
                     if neg_seqids.contains(&header.accession) {
                         include = false;
+                    }
+                }
+            }
+        }
+
+        // GI filter (positive)
+        if include {
+            if let Some(ref gis) = gi_filter {
+                if let Ok(header) = db.get_header(oid) {
+                    let gi: Option<i64> = header.accession.parse().ok();
+                    if let Some(gi) = gi {
+                        if !gis.contains(&gi) { include = false; }
+                    } else {
+                        include = false; // Can't determine GI
+                    }
+                }
+            }
+        }
+
+        // Negative GI filter
+        if include {
+            if let Some(ref neg_gis) = neg_gi_filter {
+                if let Ok(header) = db.get_header(oid) {
+                    let gi: Option<i64> = header.accession.parse().ok();
+                    if let Some(gi) = gi {
+                        if neg_gis.contains(&gi) { include = false; }
                     }
                 }
             }
@@ -484,6 +576,12 @@ fn run_blastp(args: &BlastArgs) {
         output::write_json_header(&mut out).unwrap();
     }
 
+    if args.html {
+        writeln!(out, "<!DOCTYPE html><html><head><title>BLAST Results</title>\
+            <style>body {{ font-family: monospace; white-space: pre; }}</style>\
+            </head><body>").unwrap();
+    }
+
     let filter = build_oid_filter(&db, args);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
@@ -513,6 +611,10 @@ fn run_blastp(args: &BlastArgs) {
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
     }
 
+    if args.html {
+        writeln!(out, "</body></html>").unwrap();
+    }
+
     if fmt.fmt_id == 5 {
         output::write_xml_footer(&mut out).unwrap();
     } else if fmt.fmt_id == 15 {
@@ -538,7 +640,19 @@ fn run_blastn(args: &BlastArgs) {
         std::process::exit(1);
     });
 
-    let mut params = SearchParams::blastn_defaults();
+    let mut params = if let Some(ref strat_path) = args.import_strategy {
+        let file = fs::File::open(strat_path).unwrap_or_else(|e| {
+            eprintln!("Error reading strategy: {}", e);
+            std::process::exit(1);
+        });
+        let mut reader = io::BufReader::new(file);
+        SearchParams::load_strategy(&mut reader).unwrap_or_else(|e| {
+            eprintln!("Error parsing strategy: {}", e);
+            std::process::exit(1);
+        })
+    } else {
+        SearchParams::blastn_defaults()
+    };
     if let Some(ref task) = args.task {
         apply_task_preset(&mut params, task, "blastn");
     }
@@ -563,6 +677,8 @@ fn run_blastn(args: &BlastArgs) {
     // params.soft_masking = args.soft_masking;  // TODO: add to SearchParams
     // params.lcase_masking = args.lcase_masking;  // TODO: add to SearchParams
 
+    let use_dc = args.task.as_deref() == Some("dc-megablast");
+
     let queries = read_fasta(&args.query).unwrap_or_else(|e| {
         eprintln!("Error reading query: {}", e);
         std::process::exit(1);
@@ -585,10 +701,22 @@ fn run_blastn(args: &BlastArgs) {
         output::write_json_header(&mut out).unwrap();
     }
 
+    if args.html {
+        writeln!(out, "<!DOCTYPE html><html><head><title>BLAST Results</title>\
+            <style>body {{ font-family: monospace; white-space: pre; }}</style>\
+            </head><body>").unwrap();
+    }
+
     let filter = build_oid_filter(&db, args);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        let mut results = api_blastn(&db, query_seq, &params);
+        let mut results = if use_dc {
+            let tt = args.template_type.unwrap_or(0);
+            let tl = args.template_length.unwrap_or(21);
+            blast_rs::search::dc_megablast_search(&db, query_seq, &params, tt, tl)
+        } else {
+            api_blastn(&db, query_seq, &params)
+        };
         if let Some(ref f) = filter {
             results.retain(|r| f.contains(&r.subject_oid));
         }
@@ -614,10 +742,20 @@ fn run_blastn(args: &BlastArgs) {
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
     }
 
+    if args.html {
+        writeln!(out, "</body></html>").unwrap();
+    }
+
     if fmt.fmt_id == 5 {
         output::write_xml_footer(&mut out).unwrap();
     } else if fmt.fmt_id == 15 {
         output::write_json_footer(&mut out).unwrap();
+    }
+
+    if let Some(ref strat_path) = args.export_strategy {
+        let mut f = fs::File::create(strat_path).unwrap();
+        params.save_strategy(&mut f).unwrap();
+        eprintln!("Search strategy saved to {}", strat_path.display());
     }
 }
 
@@ -702,6 +840,12 @@ fn run_blastx(args: &BlastArgs) {
     if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "blastx", &db_path, "blast-cli 0.1.0").unwrap(); }
     else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
+    if args.html {
+        writeln!(out, "<!DOCTYPE html><html><head><title>BLAST Results</title>\
+            <style>body {{ font-family: monospace; white-space: pre; }}</style>\
+            </head><body>").unwrap();
+    }
+
     let filter = build_oid_filter(&db, args);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
@@ -719,6 +863,8 @@ fn run_blastx(args: &BlastArgs) {
         };
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
     }
+
+    if args.html { writeln!(out, "</body></html>").unwrap(); }
 
     if fmt.fmt_id == 5 { output::write_xml_footer(&mut out).unwrap(); }
     else if fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
@@ -771,6 +917,12 @@ fn run_tblastn(args: &BlastArgs) {
     if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "tblastn", &db_path, "blast-cli 0.1.0").unwrap(); }
     else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
+    if args.html {
+        writeln!(out, "<!DOCTYPE html><html><head><title>BLAST Results</title>\
+            <style>body {{ font-family: monospace; white-space: pre; }}</style>\
+            </head><body>").unwrap();
+    }
+
     let filter = build_oid_filter(&db, args);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
@@ -788,6 +940,8 @@ fn run_tblastn(args: &BlastArgs) {
         };
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
     }
+
+    if args.html { writeln!(out, "</body></html>").unwrap(); }
 
     if fmt.fmt_id == 5 { output::write_xml_footer(&mut out).unwrap(); }
     else if fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
@@ -835,6 +989,12 @@ fn run_tblastx(args: &BlastArgs) {
     if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "tblastx", &db_path, "blast-cli 0.1.0").unwrap(); }
     else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
+    if args.html {
+        writeln!(out, "<!DOCTYPE html><html><head><title>BLAST Results</title>\
+            <style>body {{ font-family: monospace; white-space: pre; }}</style>\
+            </head><body>").unwrap();
+    }
+
     let filter = build_oid_filter(&db, args);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
@@ -852,6 +1012,8 @@ fn run_tblastx(args: &BlastArgs) {
         };
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
     }
+
+    if args.html { writeln!(out, "</body></html>").unwrap(); }
 
     if fmt.fmt_id == 5 { output::write_xml_footer(&mut out).unwrap(); }
     else if fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
@@ -915,7 +1077,7 @@ fn run_psiblast(args: &PsiblastArgs) {
 
         // Save ASCII PSSM if requested
         if let Some(ref ascii_path) = args.out_ascii_pssm {
-            let ncbi_query = blast_core::search::aa_to_ncbistdaa(query_seq);
+            let ncbi_query = blast_rs::search::aa_to_ncbistdaa(query_seq);
             let mut f = fs::File::create(ascii_path).unwrap_or_else(|e| {
                 eprintln!("Error creating ASCII PSSM file: {}", e);
                 std::process::exit(1);
@@ -927,6 +1089,37 @@ fn run_psiblast(args: &PsiblastArgs) {
 
     if fmt.fmt_id == 5 { output::write_xml_footer(&mut out).unwrap(); }
     else if fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
+}
+
+fn run_aliastool(args: &AliasArgs) {
+    let ext = match args.dbtype.to_ascii_lowercase().as_str() {
+        "prot" | "protein" => "pal",
+        "nucl" | "nucleotide" => "nal",
+        other => {
+            eprintln!("Unknown dbtype '{}'. Use 'prot' or 'nucl'.", other);
+            std::process::exit(1);
+        }
+    };
+
+    let title = args.title.clone().unwrap_or_else(|| {
+        args.out.to_string_lossy().into_owned()
+    });
+
+    let dblist = args.dblist.clone();
+
+    let alias_path = args.out.with_extension(ext);
+    let mut f = fs::File::create(&alias_path).unwrap_or_else(|e| {
+        eprintln!("Error creating alias file: {}", e);
+        std::process::exit(1);
+    });
+
+    writeln!(f, "#").unwrap();
+    writeln!(f, "# Alias file created by blast-cli blastdb-aliastool").unwrap();
+    writeln!(f, "#").unwrap();
+    writeln!(f, "TITLE {}", title).unwrap();
+    writeln!(f, "DBLIST {}", dblist).unwrap();
+
+    eprintln!("Alias file written: {}", alias_path.display());
 }
 
 fn run_makeblastdb(args: &MakeDbArgs) {
@@ -966,15 +1159,23 @@ fn run_makeblastdb(args: &MakeDbArgs) {
         builder.add(SequenceEntry { title, accession, sequence: seq, taxid: None });
     }
 
-    builder.write(&args.out).unwrap_or_else(|e| {
-        eprintln!("Error writing database: {}", e);
-        std::process::exit(1);
-    });
+    if args.dbversion == 5 {
+        builder.write_v5(&args.out).unwrap_or_else(|e| {
+            eprintln!("Error writing database: {}", e);
+            std::process::exit(1);
+        });
+    } else {
+        builder.write(&args.out).unwrap_or_else(|e| {
+            eprintln!("Error writing database: {}", e);
+            std::process::exit(1);
+        });
+    }
 
     let n = builder.entries.len();
     let ext = match seq_type { SeqType::Protein => "pin", SeqType::Nucleotide => "nin" };
     eprintln!(
-        "Database written: {} sequences → {}.{}",
+        "Database written (v{}): {} sequences → {}.{}",
+        args.dbversion,
         n,
         args.out.display(),
         ext
@@ -1061,14 +1262,14 @@ fn run_dumpdb(args: &DumpArgs) {
         }
 
         match db.seq_type() {
-            blast_db::index::SeqType::Protein => {
+            blast_rs::db::index::SeqType::Protein => {
                 let seq = db.get_sequence_protein(oid).unwrap_or_default();
                 writeln!(out, ">{} {}", accession, title).unwrap();
                 for chunk in seq.chunks(60) {
                     writeln!(out, "{}", std::str::from_utf8(chunk).unwrap_or("?")).unwrap();
                 }
             }
-            blast_db::index::SeqType::Nucleotide => {
+            blast_rs::db::index::SeqType::Nucleotide => {
                 let seq = db.get_sequence_nucleotide(oid).unwrap_or_default();
                 writeln!(out, ">{} {}", accession, title).unwrap();
                 for chunk in seq.chunks(60) {

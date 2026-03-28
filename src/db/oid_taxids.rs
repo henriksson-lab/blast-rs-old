@@ -10,7 +10,7 @@
 use std::fs;
 use std::path::Path;
 use memmap2::Mmap;
-use crate::error::{DbError, Result};
+use crate::db::error::{DbError, Result};
 
 pub struct OidTaxIds {
     mmap: Mmap,

@@ -3,8 +3,8 @@
 use std::fs;
 use std::path::Path;
 use byteorder::{BigEndian, LittleEndian, WriteBytesExt};
-use crate::error::Result;
-use crate::index::SeqType;
+use crate::db::error::Result;
+use crate::db::index::SeqType;
 
 /// One sequence to be added to the database.
 pub struct SequenceEntry {
@@ -31,17 +31,30 @@ impl BlastDbBuilder {
         self.entries.push(entry);
     }
 
-    /// Write all database files to `base_path` (without extension).
+    /// Write all database files to `base_path` (without extension) using v4 format.
     pub fn write(&self, base_path: &Path) -> Result<()> {
         match self.seq_type {
-            SeqType::Protein    => self.write_protein(base_path),
-            SeqType::Nucleotide => self.write_nucleotide(base_path),
+            SeqType::Protein    => self.write_protein(base_path, 4),
+            SeqType::Nucleotide => self.write_nucleotide(base_path, 4),
         }
+    }
+
+    /// Write a v5 database. Same sequence/header/index files as v4 but with
+    /// format_version=5 in the index. Full LMDB accession index writing is not
+    /// yet implemented; a warning is printed.
+    pub fn write_v5(&self, base_path: &Path) -> Result<()> {
+        match self.seq_type {
+            SeqType::Protein    => self.write_protein(base_path, 5)?,
+            SeqType::Nucleotide => self.write_nucleotide(base_path, 5)?,
+        }
+        eprintln!("Warning: v5 LMDB accession index writing is not yet implemented.");
+        eprintln!("The index file has format_version=5 but no .pdb/.ndb LMDB file was created.");
+        Ok(())
     }
 
     // ── Protein ─────────────────────────────────────────────────────────────
 
-    fn write_protein(&self, base: &Path) -> Result<()> {
+    fn write_protein(&self, base: &Path, format_version: i32) -> Result<()> {
         let mut seq_data: Vec<u8> = Vec::new();
         let mut hdr_data: Vec<u8> = Vec::new();
         let mut sequence_array: Vec<u32> = Vec::new();
@@ -69,6 +82,7 @@ impl BlastDbBuilder {
         fs::write(base.with_extension("phr"), &hdr_data)?;
         fs::write(base.with_extension("pin"), build_index(
             SeqType::Protein, &self.db_title,
+            format_version,
             self.entries.len() as u32, volume_length, max_seq_length,
             &header_array, &sequence_array, None,
         ))?;
@@ -77,7 +91,7 @@ impl BlastDbBuilder {
 
     // ── Nucleotide ───────────────────────────────────────────────────────────
 
-    fn write_nucleotide(&self, base: &Path) -> Result<()> {
+    fn write_nucleotide(&self, base: &Path, format_version: i32) -> Result<()> {
         let mut seq_data: Vec<u8> = Vec::new();
         let mut hdr_data: Vec<u8> = Vec::new();
         let mut sequence_array: Vec<u32> = Vec::new();
@@ -109,6 +123,7 @@ impl BlastDbBuilder {
         fs::write(base.with_extension("nhr"), &hdr_data)?;
         fs::write(base.with_extension("nin"), build_index(
             SeqType::Nucleotide, &self.db_title,
+            format_version,
             self.entries.len() as u32, volume_length, max_seq_length,
             &header_array, &sequence_array, Some(&ambig_array),
         ))?;
@@ -121,6 +136,7 @@ impl BlastDbBuilder {
 fn build_index(
     seq_type: SeqType,
     title: &str,
+    format_version: i32,
     num_oids: u32,
     volume_length: u64,
     max_seq_length: u32,
@@ -130,8 +146,8 @@ fn build_index(
 ) -> Vec<u8> {
     let mut buf: Vec<u8> = Vec::new();
 
-    // format_version = 4 (BigEndian)
-    buf.write_i32::<BigEndian>(4).unwrap();
+    // format_version (BigEndian)
+    buf.write_i32::<BigEndian>(format_version).unwrap();
     // seq_type: 1=protein, 0=nucleotide
     buf.write_i32::<BigEndian>(match seq_type {
         SeqType::Protein    => 1,

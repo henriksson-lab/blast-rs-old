@@ -1,4 +1,4 @@
-pub mod db;
+pub mod blastdb;
 pub mod index;
 pub mod header;
 pub mod sequence;
@@ -9,7 +9,7 @@ pub mod oid_seqids;
 pub mod oid_taxids;
 mod tests;
 
-pub use db::BlastDb;
+pub use blastdb::BlastDb;
 pub use header::BlastDefLine;
 pub use error::DbError;
 pub use builder::{BlastDbBuilder, SequenceEntry};

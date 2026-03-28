@@ -1,11 +1,12 @@
 //! Main BLAST search pipeline.
 
+use std::io::BufRead;
 use rayon::prelude::*;
-use blast_db::BlastDb;
+use crate::db::BlastDb;
 
 use crate::matrix::{ScoringMatrix, MatrixType};
 use crate::stats::{KarlinAltschul, GapPenalty, lookup_ka_params, blastn_ka_params};
-use crate::lookup::{ProteinLookup, NucleotideLookup};
+use crate::lookup::{ProteinLookup, NucleotideLookup, DiscontiguousLookup};
 use crate::extend::{ungapped_extend, gapped_extend, ungapped_extend_nucleotide};
 use crate::hsp::{Hsp, SearchResult};
 use crate::translate::{six_frame_translate_with_code, strip_stops, TranslatedFrame, reverse_complement};
@@ -399,8 +400,8 @@ fn search_one_protein(
         }
 
         // Convert alignment to ASCII for display
-        let query_aln = blast_db::sequence::decode_protein(&gh.query_aln);
-        let subject_aln = blast_db::sequence::decode_protein(&gh.subject_aln);
+        let query_aln = crate::db::sequence::decode_protein(&gh.query_aln);
+        let subject_aln = crate::db::sequence::decode_protein(&gh.subject_aln);
 
         hsps.push(Hsp {
             score: gh.score, bit_score, evalue,
@@ -422,8 +423,8 @@ fn search_one_protein(
                                    params.gap_open, params.gap_extend, params.x_drop_final);
             if gh.score > hsp.score {
                 let evalue = ka.evalue(gh.score, eff_query_len, eff_db_len);
-                let query_aln = blast_db::sequence::decode_protein(&gh.query_aln);
-                let subject_aln = blast_db::sequence::decode_protein(&gh.subject_aln);
+                let query_aln = crate::db::sequence::decode_protein(&gh.query_aln);
+                let subject_aln = crate::db::sequence::decode_protein(&gh.subject_aln);
                 *hsp = Hsp {
                     score: gh.score, bit_score: ka.bit_score(gh.score), evalue,
                     query_start: gh.q_start, query_end: gh.q_end,
@@ -954,5 +955,175 @@ pub fn tblastx_search(
     results.sort_by(|a, b| a.best_evalue().partial_cmp(&b.best_evalue()).unwrap_or(std::cmp::Ordering::Equal));
     results.truncate(params.max_target_seqs);
     results
+}
+
+/// Run a discontiguous megablast search.
+pub fn dc_megablast_search(
+    db: &BlastDb,
+    query: &[u8],
+    params: &SearchParams,
+    template_type: u8,
+    template_length: usize,
+) -> Vec<SearchResult> {
+    let ka = blastn_ka_params(params.match_score, params.mismatch, params.gap_open, params.gap_extend);
+    let db_len = db.volume_length();
+    let num_seqs = db.num_sequences() as u64;
+    let (eff_query_len, eff_db_len) = ka.effective_lengths(query.len(), db_len, num_seqs);
+
+    let dc_lookup = DiscontiguousLookup::build(query, template_type, template_length);
+
+    let oids: Vec<u32> = (0..db.num_sequences()).collect();
+
+    let mut results: Vec<SearchResult> = oids.par_iter().filter_map(|&oid| {
+        let subject = match db.get_sequence_nucleotide(oid) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        if subject.is_empty() { return None; }
+
+        let seed_hits = dc_lookup.scan_subject(&subject);
+        if seed_hits.is_empty() { return None; }
+
+        let nt_matrix = build_nt_matrix(params.match_score, params.mismatch);
+        let mut hsps = Vec::new();
+        let diag_offset = query.len();
+        let mut diag_hit = vec![false; query.len() + subject.len() + 1];
+
+        for (q_pos, s_pos) in seed_hits {
+            let q_pos = q_pos as usize;
+            let s_pos = s_pos as usize;
+            let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
+            if diag < diag_hit.len() && diag_hit[diag] { continue; }
+
+            let hit = ungapped_extend_nucleotide(query, &subject, q_pos, s_pos,
+                params.match_score, params.mismatch, params.x_drop_ungapped);
+            if hit.score > 0 {
+                if diag < diag_hit.len() { diag_hit[diag] = true; }
+
+                let center_q = (hit.q_start + hit.q_end) / 2;
+                let center_s = (hit.s_start + hit.s_end) / 2;
+                let gh = gapped_extend(query, &subject, center_q, center_s, &nt_matrix,
+                    params.gap_open, params.gap_extend, params.x_drop_gapped);
+                if gh.score <= 0 { continue; }
+
+                let evalue = ka.evalue(gh.score, eff_query_len, eff_db_len);
+                if evalue > params.evalue_threshold { continue; }
+
+                hsps.push(Hsp {
+                    score: gh.score, bit_score: ka.bit_score(gh.score), evalue,
+                    query_start: gh.q_start, query_end: gh.q_end,
+                    subject_start: gh.s_start, subject_end: gh.s_end,
+                    num_identities: gh.num_identities, num_gaps: gh.num_gaps,
+                    alignment_length: gh.query_aln.len(),
+                    query_aln: gh.query_aln, midline: gh.midline, subject_aln: gh.subject_aln,
+                    query_frame: 0, subject_frame: 0,
+                });
+            }
+        }
+
+        if hsps.is_empty() { return None; }
+        hsps.sort_by(|a, b| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal));
+
+        let header = db.get_header(oid).unwrap_or_default();
+        Some(SearchResult {
+            subject_oid: oid,
+            subject_title: header.title,
+            subject_accession: header.accession,
+            subject_len: subject.len(),
+            hsps,
+        })
+    }).collect();
+
+    results.sort_by(|a, b| a.best_evalue().partial_cmp(&b.best_evalue()).unwrap_or(std::cmp::Ordering::Equal));
+    results.truncate(params.max_target_seqs);
+    results
+}
+
+impl SearchParams {
+    /// Save search parameters to a JSON-like text format.
+    pub fn save_strategy<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
+        writeln!(out, "blast_search_strategy_v1")?;
+        writeln!(out, "word_size={}", self.word_size)?;
+        writeln!(out, "matrix={:?}", self.matrix)?;
+        writeln!(out, "gap_open={}", self.gap_open)?;
+        writeln!(out, "gap_extend={}", self.gap_extend)?;
+        writeln!(out, "evalue_threshold={}", self.evalue_threshold)?;
+        writeln!(out, "max_target_seqs={}", self.max_target_seqs)?;
+        writeln!(out, "x_drop_ungapped={}", self.x_drop_ungapped)?;
+        writeln!(out, "x_drop_gapped={}", self.x_drop_gapped)?;
+        writeln!(out, "x_drop_final={}", self.x_drop_final)?;
+        writeln!(out, "match_score={}", self.match_score)?;
+        writeln!(out, "mismatch={}", self.mismatch)?;
+        writeln!(out, "filter_low_complexity={}", self.filter_low_complexity)?;
+        writeln!(out, "comp_adjust={}", self.comp_adjust)?;
+        writeln!(out, "two_hit={}", self.two_hit)?;
+        writeln!(out, "two_hit_window={}", self.two_hit_window)?;
+        writeln!(out, "strand={}", self.strand)?;
+        writeln!(out, "query_gencode={}", self.query_gencode)?;
+        writeln!(out, "db_gencode={}", self.db_gencode)?;
+        writeln!(out, "soft_masking={}", self.soft_masking)?;
+        Ok(())
+    }
+
+    /// Load search parameters from a saved strategy file.
+    pub fn load_strategy<R: std::io::BufRead>(reader: &mut R) -> std::io::Result<Self> {
+        let mut params = SearchParams::blastp_defaults();
+        let mut first = true;
+
+        for line in reader.lines() {
+            let line = line?;
+            let line = line.trim().to_string();
+            if line.is_empty() { continue; }
+
+            if first {
+                if line != "blast_search_strategy_v1" {
+                    return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+                        "Not a valid search strategy file"));
+                }
+                first = false;
+                continue;
+            }
+
+            let mut parts = line.splitn(2, '=');
+            let key = parts.next().unwrap_or("");
+            let val = parts.next().unwrap_or("");
+
+            match key {
+                "word_size" => { params.word_size = val.parse().unwrap_or(params.word_size); }
+                "matrix" => {
+                    params.matrix = match val {
+                        "Blosum45" => MatrixType::Blosum45,
+                        "Blosum50" => MatrixType::Blosum50,
+                        "Blosum62" => MatrixType::Blosum62,
+                        "Blosum80" => MatrixType::Blosum80,
+                        "Blosum90" => MatrixType::Blosum90,
+                        "Pam30" => MatrixType::Pam30,
+                        "Pam70" => MatrixType::Pam70,
+                        "Pam250" => MatrixType::Pam250,
+                        _ => params.matrix,
+                    };
+                }
+                "gap_open" => { params.gap_open = val.parse().unwrap_or(params.gap_open); }
+                "gap_extend" => { params.gap_extend = val.parse().unwrap_or(params.gap_extend); }
+                "evalue_threshold" => { params.evalue_threshold = val.parse().unwrap_or(params.evalue_threshold); }
+                "max_target_seqs" => { params.max_target_seqs = val.parse().unwrap_or(params.max_target_seqs); }
+                "x_drop_ungapped" => { params.x_drop_ungapped = val.parse().unwrap_or(params.x_drop_ungapped); }
+                "x_drop_gapped" => { params.x_drop_gapped = val.parse().unwrap_or(params.x_drop_gapped); }
+                "x_drop_final" => { params.x_drop_final = val.parse().unwrap_or(params.x_drop_final); }
+                "match_score" => { params.match_score = val.parse().unwrap_or(params.match_score); }
+                "mismatch" => { params.mismatch = val.parse().unwrap_or(params.mismatch); }
+                "filter_low_complexity" => { params.filter_low_complexity = val.parse().unwrap_or(params.filter_low_complexity); }
+                "comp_adjust" => { params.comp_adjust = val.parse().unwrap_or(params.comp_adjust); }
+                "two_hit" => { params.two_hit = val.parse().unwrap_or(params.two_hit); }
+                "two_hit_window" => { params.two_hit_window = val.parse().unwrap_or(params.two_hit_window); }
+                "strand" => { params.strand = val.to_string(); }
+                "query_gencode" => { params.query_gencode = val.parse().unwrap_or(params.query_gencode); }
+                "db_gencode" => { params.db_gencode = val.parse().unwrap_or(params.db_gencode); }
+                "soft_masking" => { params.soft_masking = val.parse().unwrap_or(params.soft_masking); }
+                _ => {} // ignore unknown keys
+            }
+        }
+        Ok(params)
+    }
 }
 

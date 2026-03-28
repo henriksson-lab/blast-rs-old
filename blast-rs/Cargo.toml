@@ -1,7 +1,0 @@
-[workspace]
-members = [
-    "blast-db",
-    "blast-core",
-    "blast-cli",
-]
-resolver = "2"

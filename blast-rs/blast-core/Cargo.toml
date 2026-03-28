@@ -1,9 +1,0 @@
-[package]
-name = "blast-core"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-blast-db = { path = "../blast-db" }
-rayon = "1"
-thiserror = "1"

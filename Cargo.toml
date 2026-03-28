@@ -1,0 +1,16 @@
+[package]
+name = "blast-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "blast-cli"
+path = "src/main.rs"
+
+[dependencies]
+byteorder = "1"
+memmap2 = "0.9"
+lmdb = "0.8"
+rayon = "1"
+clap = { version = "4", features = ["derive"] }
+thiserror = "1"

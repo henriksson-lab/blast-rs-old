@@ -242,3 +242,104 @@ impl NucleotideLookup {
         hits.into_iter()
     }
 }
+
+/// NCBI discontiguous megablast templates.
+/// Template type 0: coding (optimized for coding sequences)
+/// Template type 1: optimal (maximizes sensitivity)
+/// Template type 2: two simultaneous templates
+pub fn get_discontiguous_template(template_type: u8, template_length: usize) -> Vec<bool> {
+    match (template_type, template_length) {
+        // Coding template, length 21, 11 care positions
+        (0, 21) => vec![
+            true, true, true, false, true, true, false, true, false, true, false,
+            false, true, true, false, true, false, true, true, true, true,
+        ],
+        // Optimal template, length 21, 11 care positions
+        (1, 21) => vec![
+            true, true, false, true, false, true, true, false, false, true, false,
+            true, false, false, true, true, false, true, true, true, true,
+        ],
+        // Coding template, length 18, 11 care positions
+        (0, 18) => vec![
+            true, true, true, false, true, true, false, true, false, true,
+            false, true, true, false, true, true, true, true,
+        ],
+        // Optimal template, length 18, 11 care positions
+        (1, 18) => vec![
+            true, true, false, true, false, true, true, false, true, false,
+            true, false, true, true, true, true, true, true,
+        ],
+        // Default: contiguous (all care)
+        _ => vec![true; template_length],
+    }
+}
+
+/// Discontiguous megablast lookup table.
+/// Uses spaced seed templates for more sensitive nucleotide searching.
+pub struct DiscontiguousLookup {
+    pub template_length: usize,
+    pub word_size: usize, // number of care positions
+    /// Template mask: true = care position, false = don't care
+    pub template: Vec<bool>,
+    /// table[code] = list of query positions
+    pub table: Vec<Vec<u32>>,
+    pub capacity: usize,
+}
+
+impl DiscontiguousLookup {
+    pub fn build(query: &[u8], template_type: u8, template_length: usize) -> Self {
+        let template = get_discontiguous_template(template_type, template_length);
+        let word_size = template.iter().filter(|&&b| b).count();
+        assert!(word_size <= 16, "word_size must be <= 16 for 32-bit index");
+        let capacity = 1usize << (2 * word_size);
+        let mut table = vec![Vec::new(); capacity];
+
+        let encoded: Vec<u8> = query.iter().map(|&b| crate::matrix::nt_to_2bit(b)).collect();
+
+        if encoded.len() < template_length {
+            return DiscontiguousLookup { template_length, word_size, template, table, capacity };
+        }
+
+        for pos in 0..=(encoded.len() - template_length) {
+            let mut code = 0u32;
+            let mut valid = true;
+            for (i, &care) in template.iter().enumerate() {
+                if care {
+                    let b = encoded[pos + i];
+                    if b > 3 { valid = false; break; }
+                    code = (code << 2) | b as u32;
+                }
+            }
+            if valid {
+                table[code as usize].push(pos as u32);
+            }
+        }
+
+        DiscontiguousLookup { template_length, word_size, template, table, capacity }
+    }
+
+    pub fn scan_subject<'a>(&'a self, subject: &'a [u8]) -> Vec<(u32, u32)> {
+        let encoded: Vec<u8> = subject.iter().map(|&b| crate::matrix::nt_to_2bit(b)).collect();
+        let mut hits = Vec::new();
+
+        if encoded.len() < self.template_length { return hits; }
+
+        for pos in 0..=(encoded.len() - self.template_length) {
+            let mut code = 0u32;
+            let mut valid = true;
+            for (i, &care) in self.template.iter().enumerate() {
+                if care {
+                    let b = encoded[pos + i];
+                    if b > 3 { valid = false; break; }
+                    code = (code << 2) | b as u32;
+                }
+            }
+            if valid {
+                for &q_pos in &self.table[code as usize] {
+                    hits.push((q_pos, pos as u32));
+                }
+            }
+        }
+        hits
+    }
+}

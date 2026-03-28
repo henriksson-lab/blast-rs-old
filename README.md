@@ -17,10 +17,9 @@ No dependency on the NCBI C++ toolkit.
 ## Workspace layout
 
 ```
-blast-rs/
-  blast-db/     library: database reader and writer
-  blast-core/   library: search algorithm, statistics, scoring matrices
-  blast-cli/    binary: blast-cli (blastp, blastn, makeblastdb, dumpdb)
+blast-db/     library: database reader and writer
+blast-core/   library: search algorithm, statistics, scoring matrices
+blast-cli/    binary: blast-cli (blastp, blastn, makeblastdb, dumpdb)
 ```
 
 ## Using blast-core as a library
@@ -31,7 +30,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-blast-core = { path = "blast-rs/blast-core" }
+blast-core = { path = "blast-core" }
 ```
 
 ### Protein search (blastp)

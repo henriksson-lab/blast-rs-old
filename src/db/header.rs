@@ -13,7 +13,7 @@
 //!       other-info SEQUENCE OF INTEGER OPTIONAL
 //!   }
 
-use crate::error::{DbError, Result};
+use crate::db::error::{DbError, Result};
 
 /// A parsed defline from the BLAST database header.
 #[derive(Debug, Clone, Default)]

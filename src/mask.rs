@@ -175,10 +175,118 @@ pub fn apply_seg_opts(seq: &mut Vec<u8>, window: usize, k1: f64, k2: f64) {
 pub fn apply_seg_ncbistdaa(seq: &mut Vec<u8>) {
     // Decode to ASCII, mask, then find which positions were masked
     let ascii: Vec<u8> = seq.iter().map(|&c| {
-        blast_db::sequence::decode_protein(&[c]).into_iter().next().unwrap_or(b'X')
+        crate::db::sequence::decode_protein(&[c]).into_iter().next().unwrap_or(b'X')
     }).collect();
     let mask = seg_mask(&ascii, SEG_WINDOW, SEG_K1, SEG_K2);
     for (i, &m) in mask.iter().enumerate() {
         if m { seq[i] = 21; } // Ncbistdaa X
+    }
+}
+
+// ─── Repeat Masker (simplified WindowMasker-like) ───────────────────────────
+
+/// Default repeat window size.
+pub const REPEAT_WINDOW: usize = 256;
+/// Default repeat n-mer size for counting.
+pub const REPEAT_NMER: usize = 15;
+/// Default repeat frequency threshold (mask n-mers occurring more than this fraction).
+pub const REPEAT_THRESHOLD: f64 = 0.01;
+
+/// Compute a repeat mask for a nucleotide sequence using n-mer frequency analysis.
+///
+/// This is a simplified version of NCBI's WindowMasker. It identifies
+/// positions covered by overrepresented n-mers (repeats/low-complexity regions).
+///
+/// Algorithm:
+/// 1. Count all n-mers in the sequence
+/// 2. Positions covered by n-mers occurring > threshold * total are masked
+pub fn repeat_mask(seq: &[u8], nmer_size: usize, threshold: f64) -> Vec<bool> {
+    use std::collections::HashMap;
+    let n = seq.len();
+    let mut masked = vec![false; n];
+    if n < nmer_size { return masked; }
+
+    let bits: Vec<u8> = seq.iter().map(|&c| nt_to_2bit(c)).collect();
+
+    // Count n-mers
+    let mut counts: HashMap<u64, u32> = HashMap::new();
+    let mut total = 0u32;
+
+    for i in 0..=(n - nmer_size) {
+        let mut code = 0u64;
+        let mut valid = true;
+        for j in 0..nmer_size {
+            let b = bits[i + j];
+            if b > 3 { valid = false; break; }
+            code = (code << 2) | b as u64;
+        }
+        if valid {
+            *counts.entry(code).or_insert(0) += 1;
+            total += 1;
+        }
+    }
+
+    if total == 0 { return masked; }
+
+    // Determine frequency cutoff
+    let cutoff = (threshold * total as f64).max(2.0) as u32;
+
+    // Mark positions covered by overrepresented n-mers
+    for i in 0..=(n - nmer_size) {
+        let mut code = 0u64;
+        let mut valid = true;
+        for j in 0..nmer_size {
+            let b = bits[i + j];
+            if b > 3 { valid = false; break; }
+            code = (code << 2) | b as u64;
+        }
+        if valid {
+            if let Some(&count) = counts.get(&code) {
+                if count >= cutoff {
+                    for j in i..i + nmer_size {
+                        masked[j] = true;
+                    }
+                }
+            }
+        }
+    }
+    masked
+}
+
+/// Apply repeat masking in-place, replacing masked positions with `b'N'`.
+pub fn apply_repeat_mask(seq: &mut Vec<u8>) {
+    apply_repeat_mask_opts(seq, REPEAT_NMER, REPEAT_THRESHOLD);
+}
+
+/// Apply repeat masking with custom parameters.
+pub fn apply_repeat_mask_opts(seq: &mut Vec<u8>, nmer_size: usize, threshold: f64) {
+    let mask = repeat_mask(seq, nmer_size, threshold);
+    for (i, &m) in mask.iter().enumerate() {
+        if m { seq[i] = b'N'; }
+    }
+}
+
+// ─── Lowercase masking helper ───────────────────────────────────────────────
+
+/// Create a mask from lowercase characters in a sequence.
+/// Returns true for positions that were lowercase in the original.
+pub fn lowercase_mask(seq: &[u8]) -> Vec<bool> {
+    seq.iter().map(|&b| b.is_ascii_lowercase()).collect()
+}
+
+/// Apply lowercase masking: replace lowercase positions with X (protein) or N (nucleotide).
+pub fn apply_lowercase_mask_protein(seq: &mut Vec<u8>) {
+    for b in seq.iter_mut() {
+        if b.is_ascii_lowercase() {
+            *b = b'X';
+        }
+    }
+}
+
+pub fn apply_lowercase_mask_nucleotide(seq: &mut Vec<u8>) {
+    for b in seq.iter_mut() {
+        if b.is_ascii_lowercase() {
+            *b = b'N';
+        }
     }
 }

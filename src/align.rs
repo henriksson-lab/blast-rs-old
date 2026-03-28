@@ -3,7 +3,7 @@
 
 /// Convert Ncbistdaa sequence back to single-letter AA codes for alignment display.
 pub fn ncbistdaa_to_ascii(seq: &[u8]) -> Vec<u8> {
-    blast_db::sequence::decode_protein(seq)
+    crate::db::sequence::decode_protein(seq)
 }
 
 /// Complement a nucleotide base (ASCII).

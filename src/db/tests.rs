@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests {
-    use crate::sequence::{decode_protein, decode_nucleotide, NCBISTDAA_TO_AA};
-    use crate::header::parse_def_line_set;
+    use crate::db::sequence::{decode_protein, decode_nucleotide, NCBISTDAA_TO_AA};
+    use crate::db::header::parse_def_line_set;
 
     #[test]
     fn test_protein_decode_roundtrip() {

@@ -13,17 +13,17 @@
 //!   9  – Binary ASN.1 (stub)
 //!  10  – Comma-separated values (CSV)
 //!  11  – BLAST archive (stub)
-//!  12  – Seqalign JSON (stub)
-//!  13  – Multiple-file JSON (stub)
-//!  14  – Multiple-file XML2 (stub)
+//!  12  – Seqalign JSON
+//!  13  – Multiple-file JSON (delegates to format 15)
+//!  14  – Multiple-file XML2 (delegates to format 16)
 //!  15  – Single-file BLAST JSON
 //!  16  – Single-file BLAST XML2
 //!  17  – Subject sequences (FASTA)
 //!  18  – Organism report (stub)
 
 use std::io::{self, Write};
-use blast_core::hsp::{Hsp, SearchResult};
-use blast_db::BlastDb;
+use blast_rs::hsp::{Hsp, SearchResult};
+use blast_rs::db::BlastDb;
 
 // ─── Public API ────────────────────────────────────────────────────────────
 
@@ -94,9 +94,12 @@ pub fn write_results(
         4 => fmt34_flat(out, ctx, results, true),
         5 => fmt5_xml(out, ctx, results),
         6 | 7 | 10 => fmt6_tabular(out, ctx, results, fmt),
-        8 | 9 | 11 | 12 | 13 | 14 => {
-            writeln!(out, "# Format {} is not implemented.", fmt.fmt_id)
+        8 | 9 | 11 => {
+            writeln!(out, "# Format {} (ASN.1/Archive) is not implemented.", fmt.fmt_id)
         }
+        12 => fmt12_seqalign_json(out, ctx, results),
+        13 => fmt13_json_multi(out, ctx, results),
+        14 => fmt14_xml2_multi(out, ctx, results),
         18 => fmt18_sam(out, ctx, results),
         15 => fmt15_json(out, ctx, results),
         16 => fmt16_xml2(out, ctx, results),
@@ -523,6 +526,79 @@ fn tabular_field(
     }
 }
 
+// ─── Format 12: Seqalign JSON ─────────────────────────────────────────────
+
+fn fmt12_seqalign_json(
+    out: &mut impl Write,
+    ctx: &SearchContext<'_>,
+    results: &[SearchResult],
+) -> io::Result<()> {
+    writeln!(out, "{{")?;
+    writeln!(out, "  \"query\": {},", json_str(ctx.query_title))?;
+    writeln!(out, "  \"query_len\": {},", ctx.query_len)?;
+    writeln!(out, "  \"program\": {},", json_str(ctx.program))?;
+    writeln!(out, "  \"database\": {},", json_str(ctx.db_path))?;
+    writeln!(out, "  \"alignments\": [")?;
+
+    for (hi, r) in results.iter().enumerate() {
+        let sid = if !r.subject_accession.is_empty() { &r.subject_accession } else { &r.subject_title };
+        let comma_r = if hi + 1 < results.len() { "," } else { "" };
+        writeln!(out, "    {{")?;
+        writeln!(out, "      \"subject_id\": {},", json_str(sid))?;
+        writeln!(out, "      \"subject_title\": {},", json_str(&r.subject_title))?;
+        writeln!(out, "      \"subject_len\": {},", r.subject_len)?;
+        writeln!(out, "      \"hsps\": [")?;
+
+        for (hj, hsp) in r.hsps.iter().enumerate() {
+            let comma_h = if hj + 1 < r.hsps.len() { "," } else { "" };
+            writeln!(out, "        {{")?;
+            writeln!(out, "          \"score\": {},", hsp.score)?;
+            writeln!(out, "          \"bit_score\": {:.1},", hsp.bit_score)?;
+            writeln!(out, "          \"evalue\": {:.2e},", hsp.evalue)?;
+            writeln!(out, "          \"identity\": {},", hsp.num_identities)?;
+            writeln!(out, "          \"align_len\": {},", hsp.alignment_length)?;
+            writeln!(out, "          \"gaps\": {},", hsp.num_gaps)?;
+            writeln!(out, "          \"query_from\": {},", hsp.query_start + 1)?;
+            writeln!(out, "          \"query_to\": {},", hsp.query_end)?;
+            writeln!(out, "          \"subject_from\": {},", hsp.subject_start + 1)?;
+            writeln!(out, "          \"subject_to\": {},", hsp.subject_end)?;
+            writeln!(out, "          \"query_strand\": {},", json_str(if hsp.query_frame < 0 { "Minus" } else { "Plus" }))?;
+            writeln!(out, "          \"subject_strand\": {},", json_str(if hsp.subject_frame < 0 { "Minus" } else { "Plus" }))?;
+            writeln!(out, "          \"qseq\": {},", json_str(str_from_aln(&hsp.query_aln)))?;
+            writeln!(out, "          \"sseq\": {},", json_str(str_from_aln(&hsp.subject_aln)))?;
+            writeln!(out, "          \"midline\": {}", json_str(str_from_aln(&hsp.midline)))?;
+            writeln!(out, "        }}{}", comma_h)?;
+        }
+        writeln!(out, "      ]")?;
+        writeln!(out, "    }}{}", comma_r)?;
+    }
+
+    writeln!(out, "  ]")?;
+    writeln!(out, "}}")
+}
+
+// ─── Format 13: Multi-file BLAST JSON ─────────────────────────────────────
+
+fn fmt13_json_multi(
+    out: &mut impl Write,
+    ctx: &SearchContext<'_>,
+    results: &[SearchResult],
+) -> io::Result<()> {
+    // Output same as format 15 (single-file JSON) since we don't do actual multi-file
+    fmt15_json(out, ctx, results)
+}
+
+// ─── Format 14: Multi-file BLAST XML2 ─────────────────────────────────────
+
+fn fmt14_xml2_multi(
+    out: &mut impl Write,
+    ctx: &SearchContext<'_>,
+    results: &[SearchResult],
+) -> io::Result<()> {
+    // Output same as format 16 (single-file XML2) since we don't do actual multi-file
+    fmt16_xml2(out, ctx, results)
+}
+
 // ─── Format 15: Single-file BLAST JSON ─────────────────────────────────────
 
 fn fmt15_json(
@@ -711,10 +787,10 @@ fn fmt17_fasta(
         writeln!(out, ">{}", sid)?;
 
         let seq: Vec<u8> = match db.seq_type() {
-            blast_db::index::SeqType::Protein => {
+            blast_rs::db::index::SeqType::Protein => {
                 db.get_sequence_protein(r.subject_oid).unwrap_or_default()
             }
-            blast_db::index::SeqType::Nucleotide => {
+            blast_rs::db::index::SeqType::Nucleotide => {
                 db.get_sequence_nucleotide(r.subject_oid).unwrap_or_default()
             }
         };
@@ -813,6 +889,30 @@ fn build_cigar(query_aln: &[u8], subject_aln: &[u8]) -> String {
     }
 
     if cigar.is_empty() { "*".to_string() } else { cigar }
+}
+
+// ─── HTML output ───────────────────────────────────────────────────────────
+
+/// Write results in HTML format (wraps pairwise output in HTML).
+pub fn write_results_html(
+    out: &mut impl Write,
+    ctx: &SearchContext<'_>,
+    results: &[SearchResult],
+) -> io::Result<()> {
+    writeln!(out, "<!DOCTYPE html>")?;
+    writeln!(out, "<html><head><title>BLAST Results</title>")?;
+    writeln!(out, "<style>")?;
+    writeln!(out, "body {{ font-family: monospace; white-space: pre; }}")?;
+    writeln!(out, ".header {{ color: #333; font-weight: bold; }}")?;
+    writeln!(out, ".hit-title {{ color: #006; }}")?;
+    writeln!(out, ".score {{ color: #060; }}")?;
+    writeln!(out, "a {{ color: #009; }}")?;
+    writeln!(out, "</style></head><body>")?;
+
+    // Use pairwise format inside the HTML body
+    fmt0_pairwise(out, ctx, results, false, false)?;
+
+    writeln!(out, "</body></html>")
 }
 
 // ─── Shared alignment helpers ───────────────────────────────────────────────

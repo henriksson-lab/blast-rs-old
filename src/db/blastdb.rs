@@ -1,13 +1,13 @@
 use std::path::{Path, PathBuf};
 use std::fs;
 use memmap2::Mmap;
-use crate::error::{DbError, Result};
-use crate::index::{IndexFile, SeqType};
-use crate::header::{BlastDefLine, parse_def_line_set};
-use crate::sequence::{get_protein_raw, get_nucleotide, decode_protein};
-use crate::lmdb_v5::LmdbV5;
-use crate::oid_seqids::OidSeqIds;
-use crate::oid_taxids::OidTaxIds;
+use crate::db::error::{DbError, Result};
+use crate::db::index::{IndexFile, SeqType};
+use crate::db::header::{BlastDefLine, parse_def_line_set};
+use crate::db::sequence::{get_protein_raw, get_nucleotide, decode_protein};
+use crate::db::lmdb_v5::LmdbV5;
+use crate::db::oid_seqids::OidSeqIds;
+use crate::db::oid_taxids::OidTaxIds;
 
 /// A single BLAST database volume.
 struct Volume {

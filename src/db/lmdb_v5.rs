@@ -9,7 +9,7 @@
 
 use std::path::Path;
 use lmdb::{self, Cursor, Database, Environment, EnvironmentFlags, Transaction};
-use crate::error::{DbError, Result};
+use crate::db::error::{DbError, Result};
 
 pub struct LmdbV5 {
     env: Environment,

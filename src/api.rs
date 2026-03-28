@@ -2,7 +2,7 @@
 //!
 //! # Example
 //! ```no_run
-//! use blast_core::{BlastDb, SearchParams, blastp, parse_fasta};
+//! use blast_rs::{BlastDb, SearchParams, blastp, parse_fasta};
 //!
 //! let db = BlastDb::open("nr".as_ref()).unwrap();
 //! let fasta = std::fs::read("query.faa").unwrap();
@@ -21,7 +21,7 @@
 //! }
 //! ```
 
-use blast_db::BlastDb;
+use crate::db::BlastDb;
 use crate::{SearchResult, SearchParams, Pssm};
 use crate::search::{blast_search, blastn_search, blastx_search, tblastn_search, tblastx_search, aa_to_ncbistdaa};
 use crate::pssm::psiblast_search;

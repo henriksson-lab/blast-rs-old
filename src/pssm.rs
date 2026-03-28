@@ -20,7 +20,7 @@ use crate::extend::{ungapped_extend, gapped_extend};
 use crate::hsp::{Hsp, SearchResult};
 use crate::compo::BACKGROUND_FREQ;
 use crate::search::{SearchParams, neighbor_threshold};
-use blast_db::BlastDb;
+use crate::db::BlastDb;
 use rayon::prelude::*;
 
 // ─── PSSM data structure ─────────────────────────────────────────────────────
@@ -271,8 +271,8 @@ fn search_one_pssm(
 
         for i in gh.q_start.min(covered.len())..gh.q_end.min(covered.len()) { covered[i] = true; }
 
-        let query_aln = blast_db::sequence::decode_protein(&gh.query_aln);
-        let subject_aln = blast_db::sequence::decode_protein(&gh.subject_aln);
+        let query_aln = crate::db::sequence::decode_protein(&gh.query_aln);
+        let subject_aln = crate::db::sequence::decode_protein(&gh.subject_aln);
 
         hsps.push(Hsp {
             score: gh.score, bit_score: ka.bit_score(gh.score), evalue,

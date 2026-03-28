@@ -1,6 +1,6 @@
 use byteorder::{BigEndian, LittleEndian, ReadBytesExt};
 use std::io::{Cursor, Read};
-use crate::error::{DbError, Result};
+use crate::db::error::{DbError, Result};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SeqType {
