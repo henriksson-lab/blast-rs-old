@@ -1,9 +1,12 @@
-//! BlastDB v4 writer – creates protein (.pin/.psq/.phr) and nucleotide (.nin/.nsq/.nhr) databases.
+//! BlastDB v4/v5 writer – creates protein (.pin/.psq/.phr) and nucleotide (.nin/.nsq/.nhr) databases.
+//! V5 additionally writes LMDB accession index (.pdb/.ndb), OID→SeqIDs (.pos/.nos),
+//! and OID→TaxIDs (.pot/.not) files.
 
 use std::fs;
 use std::path::Path;
 use byteorder::{BigEndian, LittleEndian, WriteBytesExt};
-use crate::db::error::Result;
+use lmdb::{self, DatabaseFlags, Environment, EnvironmentFlags, Transaction, WriteFlags};
+use crate::db::error::{DbError, Result};
 use crate::db::index::SeqType;
 
 /// One sequence to be added to the database.
@@ -39,16 +42,135 @@ impl BlastDbBuilder {
         }
     }
 
-    /// Write a v5 database. Same sequence/header/index files as v4 but with
-    /// format_version=5 in the index. Full LMDB accession index writing is not
-    /// yet implemented; a warning is printed.
+    /// Write a v5 database: sequence/header/index files (format_version=5) plus
+    /// LMDB accession index (.pdb/.ndb), OID→SeqIDs (.pos/.nos), and OID→TaxIDs (.pot/.not).
     pub fn write_v5(&self, base_path: &Path) -> Result<()> {
         match self.seq_type {
             SeqType::Protein    => self.write_protein(base_path, 5)?,
             SeqType::Nucleotide => self.write_nucleotide(base_path, 5)?,
         }
-        eprintln!("Warning: v5 LMDB accession index writing is not yet implemented.");
-        eprintln!("The index file has format_version=5 but no .pdb/.ndb LMDB file was created.");
+        self.write_lmdb(base_path)?;
+        self.write_oid_seqids(base_path)?;
+        self.write_oid_taxids(base_path)?;
+        Ok(())
+    }
+
+    /// Write the LMDB accession index (.pdb/.ndb).
+    fn write_lmdb(&self, base: &Path) -> Result<()> {
+        let ext = match self.seq_type {
+            SeqType::Protein    => "pdb",
+            SeqType::Nucleotide => "ndb",
+        };
+        let lmdb_path = base.with_extension(ext);
+
+        let env = Environment::new()
+            .set_flags(EnvironmentFlags::NO_SUB_DIR)
+            .set_max_dbs(4)
+            .set_map_size(1 << 30) // 1 GiB virtual; grows as needed
+            .open(&lmdb_path)
+            .map_err(|e| DbError::InvalidFormat(format!("LMDB create '{}': {}", lmdb_path.display(), e)))?;
+
+        // Create named databases
+        let db_acc2oid = env.create_db(Some("acc2oid"), DatabaseFlags::DUP_SORT | DatabaseFlags::DUP_FIXED)
+            .map_err(|e| DbError::InvalidFormat(format!("LMDB create 'acc2oid': {}", e)))?;
+        let db_volname = env.create_db(Some("volname"), DatabaseFlags::INTEGER_KEY)
+            .map_err(|e| DbError::InvalidFormat(format!("LMDB create 'volname': {}", e)))?;
+        let db_volinfo = env.create_db(Some("volinfo"), DatabaseFlags::INTEGER_KEY)
+            .map_err(|e| DbError::InvalidFormat(format!("LMDB create 'volinfo': {}", e)))?;
+
+        let mut txn = env.begin_rw_txn()
+            .map_err(|e| DbError::InvalidFormat(format!("LMDB write txn: {}", e)))?;
+
+        // acc2oid: accession bytes → LE u32 OID
+        for (oid, entry) in self.entries.iter().enumerate() {
+            let oid_bytes = (oid as u32).to_le_bytes();
+            txn.put(db_acc2oid, &entry.accession.as_bytes(), &oid_bytes, WriteFlags::empty())
+                .map_err(|e| DbError::InvalidFormat(format!("LMDB put acc2oid: {}", e)))?;
+        }
+
+        // volname: key=native u32 0 → volume base name
+        let vol_key: u32 = 0;
+        let vol_name = base.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        txn.put(db_volname, &vol_key.to_ne_bytes(), &vol_name.as_bytes(), WriteFlags::empty())
+            .map_err(|e| DbError::InvalidFormat(format!("LMDB put volname: {}", e)))?;
+
+        // volinfo: key=native u32 0 → LE u32 num_oids
+        let num_oids = (self.entries.len() as u32).to_le_bytes();
+        txn.put(db_volinfo, &vol_key.to_ne_bytes(), &num_oids, WriteFlags::empty())
+            .map_err(|e| DbError::InvalidFormat(format!("LMDB put volinfo: {}", e)))?;
+
+        txn.commit()
+            .map_err(|e| DbError::InvalidFormat(format!("LMDB commit: {}", e)))?;
+
+        Ok(())
+    }
+
+    /// Write the OID→SeqIDs file (.pos/.nos).
+    fn write_oid_seqids(&self, base: &Path) -> Result<()> {
+        let ext = match self.seq_type {
+            SeqType::Protein    => "pos",
+            SeqType::Nucleotide => "nos",
+        };
+        let num_oids = self.entries.len() as u64;
+
+        // Build data section: for each OID, encode the accession as a length-prefixed string
+        let mut data_section: Vec<u8> = Vec::new();
+        let mut end_offsets: Vec<u64> = Vec::new();
+
+        for entry in &self.entries {
+            let acc = entry.accession.as_bytes();
+            if acc.len() < 0xFF {
+                data_section.push(acc.len() as u8);
+            } else {
+                data_section.push(0xFF);
+                data_section.extend_from_slice(&(acc.len() as u32).to_le_bytes());
+            }
+            data_section.extend_from_slice(acc);
+            end_offsets.push(data_section.len() as u64);
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&num_oids.to_le_bytes());
+        for &off in &end_offsets {
+            buf.extend_from_slice(&off.to_le_bytes());
+        }
+        buf.extend_from_slice(&data_section);
+
+        fs::write(base.with_extension(ext), &buf)?;
+        Ok(())
+    }
+
+    /// Write the OID→TaxIDs file (.pot/.not).
+    fn write_oid_taxids(&self, base: &Path) -> Result<()> {
+        let ext = match self.seq_type {
+            SeqType::Protein    => "pot",
+            SeqType::Nucleotide => "not",
+        };
+        let num_oids = self.entries.len() as u64;
+
+        // Build data section: for each OID, write its taxid(s) as i32 LE
+        let mut data_section: Vec<u8> = Vec::new();
+        let mut end_offsets: Vec<u64> = Vec::new(); // in units of i32 elements
+
+        let mut elem_count: u64 = 0;
+        for entry in &self.entries {
+            if let Some(taxid) = entry.taxid {
+                data_section.extend_from_slice(&(taxid as i32).to_le_bytes());
+                elem_count += 1;
+            }
+            end_offsets.push(elem_count);
+        }
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(&num_oids.to_le_bytes());
+        for &off in &end_offsets {
+            buf.extend_from_slice(&off.to_le_bytes());
+        }
+        buf.extend_from_slice(&data_section);
+
+        fs::write(base.with_extension(ext), &buf)?;
         Ok(())
     }
 

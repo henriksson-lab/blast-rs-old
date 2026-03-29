@@ -9,10 +9,10 @@
 //!   5  – BLAST XML (version 1)
 //!   6  – Tabular (12 standard columns, or user-specified)
 //!   7  – Tabular with comment lines
-//!   8  – Text ASN.1 (stub)
-//!   9  – Binary ASN.1 (stub)
+//!   8  – Text ASN.1 (Seq-annot with Dense-seg alignments)
+//!   9  – Binary ASN.1 (BER-encoded Seq-annot)
 //!  10  – Comma-separated values (CSV)
-//!  11  – BLAST archive (stub)
+//!  11  – BLAST archive (Blast4-archive with search params + results)
 //!  12  – Seqalign JSON
 //!  13  – Multiple-file JSON (delegates to format 15)
 //!  14  – Multiple-file XML2 (delegates to format 16)
@@ -94,9 +94,9 @@ pub fn write_results(
         4 => fmt34_flat(out, ctx, results, true),
         5 => fmt5_xml(out, ctx, results),
         6 | 7 | 10 => fmt6_tabular(out, ctx, results, fmt),
-        8 | 9 | 11 => {
-            writeln!(out, "# Format {} (ASN.1/Archive) is not implemented.", fmt.fmt_id)
-        }
+        8 => fmt8_asn_text(out, ctx, results),
+        9 => fmt9_asn_binary(out, ctx, results),
+        11 => fmt11_archive(out, ctx, results),
         12 => fmt12_seqalign_json(out, ctx, results),
         13 => fmt13_json_multi(out, ctx, results),
         14 => fmt14_xml2_multi(out, ctx, results),
@@ -524,6 +524,553 @@ fn tabular_field(
             }
         }
     }
+}
+
+// ─── Format 8: Text ASN.1 (Seq-annot) ─────────────────────────────────────
+
+/// Build Dense-seg segment data from gapped alignment strings.
+/// Returns (starts, lens, numseg) where starts is interleaved [q_start, s_start] per segment.
+/// A start of -1 means a gap in that sequence for that segment.
+fn build_denseg(hsp: &Hsp) -> (Vec<i64>, Vec<usize>, usize) {
+    let mut starts: Vec<i64> = Vec::new();
+    let mut lens: Vec<usize> = Vec::new();
+
+    let mut q_pos = hsp.query_start;
+    let mut s_pos = hsp.subject_start;
+    let mut seg_len = 0usize;
+    let mut seg_type: u8 = 0; // 0=match, 1=gap-in-query, 2=gap-in-subject
+    let mut seg_q_start: i64 = q_pos as i64;
+    let mut seg_s_start: i64 = s_pos as i64;
+
+    for i in 0..hsp.query_aln.len() {
+        let q = hsp.query_aln[i];
+        let s = hsp.subject_aln[i];
+        let cur_type = if q == b'-' { 1u8 } else if s == b'-' { 2u8 } else { 0u8 };
+
+        if i == 0 {
+            seg_type = cur_type;
+            seg_q_start = if cur_type == 1 { -1 } else { q_pos as i64 };
+            seg_s_start = if cur_type == 2 { -1 } else { s_pos as i64 };
+            seg_len = 1;
+        } else if cur_type != seg_type {
+            // flush previous segment
+            starts.push(seg_q_start);
+            starts.push(seg_s_start);
+            lens.push(seg_len);
+            // start new segment
+            seg_type = cur_type;
+            seg_q_start = if cur_type == 1 { -1 } else { q_pos as i64 };
+            seg_s_start = if cur_type == 2 { -1 } else { s_pos as i64 };
+            seg_len = 1;
+        } else {
+            seg_len += 1;
+        }
+
+        if q != b'-' { q_pos += 1; }
+        if s != b'-' { s_pos += 1; }
+    }
+
+    // flush last segment
+    if seg_len > 0 {
+        starts.push(seg_q_start);
+        starts.push(seg_s_start);
+        lens.push(seg_len);
+    }
+
+    let numseg = lens.len();
+    (starts, lens, numseg)
+}
+
+/// Write a single Seq-align in text ASN.1 notation.
+fn write_seqalign_text(
+    out: &mut impl Write,
+    indent: &str,
+    ctx: &SearchContext<'_>,
+    r: &SearchResult,
+    hsp: &Hsp,
+) -> io::Result<()> {
+    let (starts, lens, numseg) = build_denseg(hsp);
+    let qid = first_word(ctx.query_title);
+    let sid = if !r.subject_accession.is_empty() { &r.subject_accession } else { first_word(&r.subject_title) };
+
+    writeln!(out, "{}{{", indent)?;
+    writeln!(out, "{}  type partial ,", indent)?;
+    writeln!(out, "{}  dim 2 ,", indent)?;
+    writeln!(out, "{}  score {{", indent)?;
+    writeln!(out, "{}    {{", indent)?;
+    writeln!(out, "{}      id str \"score\" ,", indent)?;
+    writeln!(out, "{}      value int {}", indent, hsp.score)?;
+    writeln!(out, "{}    }} ,", indent)?;
+    writeln!(out, "{}    {{", indent)?;
+    writeln!(out, "{}      id str \"e_value\" ,", indent)?;
+    write_asn_real(out, &format!("{}      ", indent), hsp.evalue)?;
+    writeln!(out, "{}    }} ,", indent)?;
+    writeln!(out, "{}    {{", indent)?;
+    writeln!(out, "{}      id str \"bit_score\" ,", indent)?;
+    write_asn_real(out, &format!("{}      ", indent), hsp.bit_score)?;
+    writeln!(out, "{}    }} ,", indent)?;
+    writeln!(out, "{}    {{", indent)?;
+    writeln!(out, "{}      id str \"num_ident\" ,", indent)?;
+    writeln!(out, "{}      value int {}", indent, hsp.num_identities)?;
+    writeln!(out, "{}    }}", indent)?;
+    writeln!(out, "{}  }} ,", indent)?;
+    writeln!(out, "{}  segs denseg {{", indent)?;
+    writeln!(out, "{}    dim 2 ,", indent)?;
+    writeln!(out, "{}    numseg {} ,", indent, numseg)?;
+    writeln!(out, "{}    ids {{", indent)?;
+    writeln!(out, "{}      local str \"{}\" ,", indent, asn_escape(qid))?;
+    writeln!(out, "{}      local str \"{}\"", indent, asn_escape(sid))?;
+    writeln!(out, "{}    }} ,", indent)?;
+    // starts
+    writeln!(out, "{}    starts {{", indent)?;
+    for (i, &s) in starts.iter().enumerate() {
+        let comma = if i + 1 < starts.len() { " ," } else { "" };
+        writeln!(out, "{}      {}{}", indent, s, comma)?;
+    }
+    writeln!(out, "{}    }} ,", indent)?;
+    // lens
+    writeln!(out, "{}    lens {{", indent)?;
+    for (i, &l) in lens.iter().enumerate() {
+        let comma = if i + 1 < lens.len() { " ," } else { "" };
+        writeln!(out, "{}      {}{}", indent, l, comma)?;
+    }
+    writeln!(out, "{}    }}", indent)?;
+    writeln!(out, "{}  }}", indent)?;
+    writeln!(out, "{}}}", indent)
+}
+
+/// Write an ASN.1 REAL value in NCBI's mantissa/base/exponent notation.
+fn write_asn_real(out: &mut impl Write, indent: &str, val: f64) -> io::Result<()> {
+    if val == 0.0 {
+        writeln!(out, "{}value real {{ 0, 10, 0 }}", indent)
+    } else {
+        // Represent as mantissa * 10^exponent where mantissa is an integer
+        let s = format!("{:.15e}", val);
+        let parts: Vec<&str> = s.split('e').collect();
+        let mantissa_str = parts[0]; // e.g. "1.234000000000000"
+        let exp: i32 = parts[1].parse().unwrap_or(0);
+
+        // Remove decimal point and trailing zeros to get integer mantissa
+        let cleaned = mantissa_str.replace('.', "");
+        let trimmed = cleaned.trim_end_matches('0');
+        let trimmed = if trimmed.is_empty() { "0" } else { trimmed };
+
+        // Number of digits after decimal point that we kept
+        let frac_digits = mantissa_str.len() - mantissa_str.find('.').unwrap_or(mantissa_str.len()) - 1;
+        let actual_exp = exp - frac_digits as i32 + (cleaned.len() - trimmed.len()) as i32;
+
+        // mantissa as integer, exponent adjusted
+        let mantissa_int: i64 = trimmed.parse().unwrap_or(0);
+        let sign = if val < 0.0 && mantissa_int > 0 { -1i64 } else { 1 };
+        writeln!(out, "{}value real {{ {}, 10, {} }}", indent, mantissa_int * sign, actual_exp)
+    }
+}
+
+fn fmt8_asn_text(
+    out: &mut impl Write,
+    ctx: &SearchContext<'_>,
+    results: &[SearchResult],
+) -> io::Result<()> {
+    writeln!(out, "Seq-annot ::= {{")?;
+    writeln!(out, "  desc {{")?;
+    writeln!(out, "    name \"BLAST {}\" ,", asn_escape(ctx.program))?;
+    writeln!(out, "    title \"Database: {}\"", asn_escape(ctx.db_title))?;
+    writeln!(out, "  }} ,")?;
+    writeln!(out, "  data align {{")?;
+
+    let total_hsps: usize = results.iter().map(|r| r.hsps.len()).sum();
+    let mut hsp_idx = 0;
+    for r in results {
+        for hsp in &r.hsps {
+            write_seqalign_text(out, "    ", ctx, r, hsp)?;
+            hsp_idx += 1;
+            if hsp_idx < total_hsps {
+                writeln!(out, "    ,")?;
+            }
+        }
+    }
+
+    writeln!(out, "  }}")?;
+    writeln!(out, "}}")
+}
+
+// ─── Format 9: Binary ASN.1 (Seq-annot, BER) ─────────────────────────────
+
+/// Encode an ASN.1 tag in BER.
+fn ber_tag(class: u8, constructed: bool, tag_num: u32) -> Vec<u8> {
+    let class_bits = class << 6;
+    let constructed_bit = if constructed { 0x20 } else { 0x00 };
+
+    if tag_num < 31 {
+        vec![class_bits | constructed_bit | (tag_num as u8)]
+    } else {
+        let mut bytes = vec![class_bits | constructed_bit | 0x1F];
+        let mut t = tag_num;
+        let mut stack = Vec::new();
+        while t > 0 {
+            stack.push((t & 0x7F) as u8);
+            t >>= 7;
+        }
+        for (i, &b) in stack.iter().rev().enumerate() {
+            if i + 1 < stack.len() {
+                bytes.push(b | 0x80);
+            } else {
+                bytes.push(b);
+            }
+        }
+        bytes
+    }
+}
+
+/// Encode BER length.
+fn ber_length(len: usize) -> Vec<u8> {
+    if len < 128 {
+        vec![len as u8]
+    } else if len < 256 {
+        vec![0x81, len as u8]
+    } else if len < 65536 {
+        vec![0x82, (len >> 8) as u8, (len & 0xFF) as u8]
+    } else if len < 16777216 {
+        vec![0x83, (len >> 16) as u8, ((len >> 8) & 0xFF) as u8, (len & 0xFF) as u8]
+    } else {
+        vec![0x84, (len >> 24) as u8, ((len >> 16) & 0xFF) as u8, ((len >> 8) & 0xFF) as u8, (len & 0xFF) as u8]
+    }
+}
+
+/// Encode a BER TLV.
+fn ber_tlv(class: u8, constructed: bool, tag_num: u32, value: &[u8]) -> Vec<u8> {
+    let mut out = ber_tag(class, constructed, tag_num);
+    out.extend_from_slice(&ber_length(value.len()));
+    out.extend_from_slice(value);
+    out
+}
+
+/// BER INTEGER encoding.
+fn ber_integer(val: i64) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if val == 0 {
+        bytes.push(0);
+    } else {
+        let mut v = val;
+        let mut stack = Vec::new();
+        if val > 0 {
+            while v > 0 {
+                stack.push((v & 0xFF) as u8);
+                v >>= 8;
+            }
+            // ensure high bit clear for positive
+            if stack.last().map_or(false, |&b| b & 0x80 != 0) {
+                stack.push(0);
+            }
+        } else {
+            while v < -1 || (stack.last().map_or(true, |&b| b & 0x80 == 0)) {
+                stack.push((v & 0xFF) as u8);
+                v >>= 8;
+                if stack.len() > 8 { break; }
+            }
+        }
+        stack.reverse();
+        bytes = stack;
+    }
+    ber_tlv(0, false, 2, &bytes) // UNIVERSAL INTEGER tag=2
+}
+
+/// BER REAL encoding (base-10 NR3 form).
+fn ber_real(val: f64) -> Vec<u8> {
+    if val == 0.0 {
+        return ber_tlv(0, false, 9, &[]); // zero-length for 0.0
+    }
+    // Use NR3 form: mantissa.Eexponent as ASCII
+    let s = format!("{:.15E}", val);
+    let nr3 = format!(" {}", s); // leading space = NR3 form indicator
+    let mut content = vec![0x03u8]; // NR3 form
+    content.extend_from_slice(nr3.as_bytes());
+    ber_tlv(0, false, 9, &content) // UNIVERSAL REAL tag=9
+}
+
+/// BER VisibleString.
+fn ber_visiblestring(s: &str) -> Vec<u8> {
+    ber_tlv(0, false, 26, s.as_bytes()) // UNIVERSAL VisibleString tag=26
+}
+
+/// BER ENUMERATED.
+fn ber_enumerated(val: i32) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if val >= 0 && val < 128 {
+        bytes.push(val as u8);
+    } else {
+        let mut v = val as i64;
+        let mut stack = Vec::new();
+        if val >= 0 {
+            while v > 0 { stack.push((v & 0xFF) as u8); v >>= 8; }
+            if stack.last().map_or(false, |&b| b & 0x80 != 0) { stack.push(0); }
+        } else {
+            while v < -1 || stack.last().map_or(true, |&b| b & 0x80 == 0) {
+                stack.push((v & 0xFF) as u8); v >>= 8;
+                if stack.len() > 4 { break; }
+            }
+        }
+        stack.reverse();
+        bytes = stack;
+    }
+    ber_tlv(0, false, 10, &bytes) // UNIVERSAL ENUMERATED tag=10
+}
+
+/// Wrap content with a context-specific constructed tag.
+fn ber_context(tag_num: u32, content: &[u8]) -> Vec<u8> {
+    ber_tlv(2, true, tag_num, content) // CONTEXT-SPECIFIC, CONSTRUCTED
+}
+
+/// Wrap content with a context-specific primitive tag.
+fn ber_context_prim(tag_num: u32, content: &[u8]) -> Vec<u8> {
+    ber_tlv(2, false, tag_num, content)
+}
+
+/// BER SEQUENCE (UNIVERSAL 16 constructed).
+fn ber_sequence(content: &[u8]) -> Vec<u8> {
+    ber_tlv(0, true, 16, content)
+}
+
+/// BER SET OF (UNIVERSAL 17 constructed).
+fn ber_set_of(content: &[u8]) -> Vec<u8> {
+    ber_tlv(0, true, 17, content)
+}
+
+/// Build a BER-encoded Score structure.
+fn ber_score_int(name: &str, val: i64) -> Vec<u8> {
+    // Score ::= SEQUENCE { id [0] Object-id, value [1] CHOICE { int INTEGER } }
+    let id = ber_context(0, &ber_visiblestring(name)); // Object-id as VisibleString via [0]
+    let value_inner = ber_integer(val);
+    let value = ber_context(1, &value_inner);
+    let mut content = Vec::new();
+    content.extend_from_slice(&id);
+    content.extend_from_slice(&value);
+    ber_sequence(&content)
+}
+
+fn ber_score_real(name: &str, val: f64) -> Vec<u8> {
+    let id = ber_context(0, &ber_visiblestring(name));
+    let value_inner = ber_real(val);
+    let value = ber_context(1, &value_inner);
+    let mut content = Vec::new();
+    content.extend_from_slice(&id);
+    content.extend_from_slice(&value);
+    ber_sequence(&content)
+}
+
+/// Build a BER Seq-align for one HSP.
+fn ber_seqalign(ctx: &SearchContext<'_>, r: &SearchResult, hsp: &Hsp) -> Vec<u8> {
+    let (starts_data, lens_data, numseg) = build_denseg(hsp);
+    let qid = first_word(ctx.query_title);
+    let sid = if !r.subject_accession.is_empty() { &r.subject_accession } else { first_word(&r.subject_title) };
+
+    // type [0] ENUMERATED: partial=3
+    let sa_type = ber_context(0, &ber_enumerated(3));
+    // dim [1] INTEGER
+    let sa_dim = ber_context(1, &ber_integer(2));
+
+    // score [2] SET OF Score
+    let mut scores_content = Vec::new();
+    scores_content.extend_from_slice(&ber_score_int("score", hsp.score as i64));
+    scores_content.extend_from_slice(&ber_score_real("e_value", hsp.evalue));
+    scores_content.extend_from_slice(&ber_score_real("bit_score", hsp.bit_score));
+    scores_content.extend_from_slice(&ber_score_int("num_ident", hsp.num_identities as i64));
+    let sa_scores = ber_context(2, &ber_set_of(&scores_content));
+
+    // segs [3] CHOICE denseg [1]
+    // Dense-seg ::= SEQUENCE { dim, numseg, ids, starts, lens }
+    let ds_dim = ber_context(0, &ber_integer(2));
+    let ds_numseg = ber_context(1, &ber_integer(numseg as i64));
+
+    // ids [2] SEQUENCE OF Seq-id; using local str
+    let qid_ber = ber_context(0, &ber_visiblestring(qid)); // Seq-id local [0]
+    let sid_ber = ber_context(0, &ber_visiblestring(sid));
+    let mut ids_content = Vec::new();
+    // Wrap each as a CHOICE: local [0] Object-id str VisibleString
+    ids_content.extend_from_slice(&ber_sequence(&qid_ber));
+    ids_content.extend_from_slice(&ber_sequence(&sid_ber));
+    let ds_ids = ber_context(2, &ber_sequence(&ids_content));
+
+    // starts [3] SEQUENCE OF INTEGER
+    let mut starts_enc = Vec::new();
+    for &s in &starts_data {
+        starts_enc.extend_from_slice(&ber_integer(s));
+    }
+    let ds_starts = ber_context(3, &ber_sequence(&starts_enc));
+
+    // lens [4] SEQUENCE OF INTEGER
+    let mut lens_enc = Vec::new();
+    for &l in &lens_data {
+        lens_enc.extend_from_slice(&ber_integer(l as i64));
+    }
+    let ds_lens = ber_context(4, &ber_sequence(&lens_enc));
+
+    let mut denseg_content = Vec::new();
+    denseg_content.extend_from_slice(&ds_dim);
+    denseg_content.extend_from_slice(&ds_numseg);
+    denseg_content.extend_from_slice(&ds_ids);
+    denseg_content.extend_from_slice(&ds_starts);
+    denseg_content.extend_from_slice(&ds_lens);
+
+    let sa_segs = ber_context(3, &ber_context(1, &ber_sequence(&denseg_content))); // denseg is CHOICE [1]
+
+    let mut sa_content = Vec::new();
+    sa_content.extend_from_slice(&sa_type);
+    sa_content.extend_from_slice(&sa_dim);
+    sa_content.extend_from_slice(&sa_scores);
+    sa_content.extend_from_slice(&sa_segs);
+    ber_sequence(&sa_content)
+}
+
+fn fmt9_asn_binary(
+    out: &mut impl Write,
+    ctx: &SearchContext<'_>,
+    results: &[SearchResult],
+) -> io::Result<()> {
+    // Seq-annot ::= SEQUENCE { desc [0], data [1] CHOICE align [2] SET OF Seq-align }
+    let db_title = ctx.db_title;
+    let prog_name = format!("BLAST {}", ctx.program);
+
+    // desc [0]: Annot-descr ::= SET OF Annotdesc
+    // name [0] VisibleString, title [1] VisibleString
+    let name_desc = ber_context(0, &ber_visiblestring(&prog_name));
+    let title_desc = ber_context(1, &ber_visiblestring(&format!("Database: {}", db_title)));
+    let mut desc_content = Vec::new();
+    desc_content.extend_from_slice(&name_desc);
+    desc_content.extend_from_slice(&title_desc);
+    let sa_desc = ber_context(0, &ber_set_of(&desc_content));
+
+    // data [1] CHOICE align [2] SET OF Seq-align
+    let mut aligns = Vec::new();
+    for r in results {
+        for hsp in &r.hsps {
+            aligns.extend_from_slice(&ber_seqalign(ctx, r, hsp));
+        }
+    }
+    let sa_data = ber_context(1, &ber_context(2, &ber_set_of(&aligns)));
+
+    let mut content = Vec::new();
+    content.extend_from_slice(&sa_desc);
+    content.extend_from_slice(&sa_data);
+    let encoded = ber_sequence(&content);
+
+    out.write_all(&encoded)
+}
+
+// ─── Format 11: BLAST Archive (Blast4-archive, text ASN.1) ───────────────
+
+fn fmt11_archive(
+    out: &mut impl Write,
+    ctx: &SearchContext<'_>,
+    results: &[SearchResult],
+) -> io::Result<()> {
+    let qid = first_word(ctx.query_title);
+
+    writeln!(out, "Blast4-archive ::= {{")?;
+
+    // request
+    writeln!(out, "  request {{")?;
+    writeln!(out, "    ident \"blast-rs\" ,")?;
+    writeln!(out, "    body queue-search {{")?;
+    writeln!(out, "      program \"{}\" ,", asn_escape(ctx.program))?;
+    writeln!(out, "      service \"plain\" ,")?;
+    writeln!(out, "      queries bioseq-set {{")?;
+    writeln!(out, "        seq-set {{")?;
+    writeln!(out, "          seq {{")?;
+    writeln!(out, "            id {{")?;
+    writeln!(out, "              local str \"{}\"", asn_escape(qid))?;
+    writeln!(out, "            }} ,")?;
+    writeln!(out, "            descr {{")?;
+    writeln!(out, "              title \"{}\"", asn_escape(ctx.query_title))?;
+    writeln!(out, "            }} ,")?;
+    writeln!(out, "            inst {{")?;
+    writeln!(out, "              repr raw ,")?;
+    // Determine molecule type from program
+    let mol = if matches!(ctx.program, "blastn" | "tblastx" | "tblastn") { "na" } else { "aa" };
+    writeln!(out, "              mol {} ,", mol)?;
+    writeln!(out, "              length {}", ctx.query_len)?;
+    writeln!(out, "            }}")?;
+    writeln!(out, "          }}")?;
+    writeln!(out, "        }}")?;
+    writeln!(out, "      }} ,")?;
+    writeln!(out, "      subject database \"{}\" ,", asn_escape(ctx.db_path))?;
+    writeln!(out, "      algorithm-options {{")?;
+    writeln!(out, "        {{")?;
+    writeln!(out, "          name \"EvalueThreshold\" ,")?;
+    write!(out, "          value cutoff e-value ")?;
+    write_asn_real_inline(out, ctx.evalue_threshold)?;
+    writeln!(out)?;
+    writeln!(out, "        }} ,")?;
+    writeln!(out, "        {{")?;
+    writeln!(out, "          name \"GapOpeningCost\" ,")?;
+    writeln!(out, "          value integer {}", ctx.gap_open)?;
+    writeln!(out, "        }} ,")?;
+    writeln!(out, "        {{")?;
+    writeln!(out, "          name \"GapExtensionCost\" ,")?;
+    writeln!(out, "          value integer {}", ctx.gap_extend)?;
+    writeln!(out, "        }} ,")?;
+    writeln!(out, "        {{")?;
+    writeln!(out, "          name \"MatrixName\" ,")?;
+    writeln!(out, "          value string \"{}\"", asn_escape(ctx.matrix))?;
+    writeln!(out, "        }}")?;
+    writeln!(out, "      }}")?;
+    writeln!(out, "    }}")?;
+    writeln!(out, "  }} ,")?;
+
+    // results
+    writeln!(out, "  results {{")?;
+
+    // alignments
+    if !results.is_empty() {
+        writeln!(out, "    alignments {{")?;
+        let total_hsps: usize = results.iter().map(|r| r.hsps.len()).sum();
+        let mut hsp_idx = 0;
+        for r in results {
+            for hsp in &r.hsps {
+                write_seqalign_text(out, "      ", ctx, r, hsp)?;
+                hsp_idx += 1;
+                if hsp_idx < total_hsps {
+                    writeln!(out, "      ,")?;
+                }
+            }
+        }
+        writeln!(out, "    }} ,")?;
+    }
+
+    // search-stats
+    writeln!(out, "    search-stats {{")?;
+    writeln!(out, "      \"db-num={}\" ,", ctx.db_num_seqs)?;
+    writeln!(out, "      \"db-len={}\"", ctx.db_len)?;
+    writeln!(out, "    }}")?;
+
+    writeln!(out, "  }}")?;
+    writeln!(out, "}}")
+}
+
+/// Write ASN.1 REAL value inline as {{ mantissa, 10, exponent }}.
+fn write_asn_real_inline(out: &mut impl Write, val: f64) -> io::Result<()> {
+    if val == 0.0 {
+        write!(out, "{{ 0, 10, 0 }}")
+    } else {
+        // Decompose into integer mantissa * 10^exp
+        let s = format!("{:.15e}", val);
+        let parts: Vec<&str> = s.split('e').collect();
+        let mantissa_str = parts[0];
+        let exp: i32 = parts[1].parse().unwrap_or(0);
+        let cleaned = mantissa_str.replace('.', "");
+        let trimmed = cleaned.trim_end_matches('0');
+        let trimmed = if trimmed.is_empty() { "0" } else { trimmed };
+        let frac_digits = mantissa_str.len() - mantissa_str.find('.').unwrap_or(mantissa_str.len()) - 1;
+        let actual_exp = exp - frac_digits as i32 + (cleaned.len() - trimmed.len()) as i32;
+        let mantissa_int: i64 = trimmed.parse().unwrap_or(0);
+        let sign = if val < 0.0 && mantissa_int > 0 { -1i64 } else { 1 };
+        write!(out, "{{ {}, 10, {} }}", mantissa_int * sign, actual_exp)
+    }
+}
+
+/// Escape a string for text ASN.1 (double-quote delimited).
+fn asn_escape(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 // ─── Format 12: Seqalign JSON ─────────────────────────────────────────────

@@ -132,10 +132,15 @@ impl BlastDb {
         }
 
         // Check for multi-volume: path.00.pin, path.01.pin, etc.
+        // Note: we must check for the full filename (e.g. "db.00.pin") by
+        // constructing the path directly, because Path::with_extension would
+        // replace ".00" (treating it as an extension) instead of appending ".pin".
         let mut vol_paths = Vec::new();
         for i in 0..1000u32 {
             let vol_base = PathBuf::from(format!("{}.{:02}", path.display(), i));
-            if vol_base.with_extension("pin").exists() || vol_base.with_extension("nin").exists() {
+            let pin_path = PathBuf::from(format!("{}.{:02}.pin", path.display(), i));
+            let nin_path = PathBuf::from(format!("{}.{:02}.nin", path.display(), i));
+            if pin_path.exists() || nin_path.exists() {
                 vol_paths.push(vol_base);
             } else {
                 break;
