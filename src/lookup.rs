@@ -3,14 +3,29 @@
 use crate::matrix::ScoringMatrix;
 
 /// Protein lookup table using neighboring words.
-/// Uses a flat array indexed by base-28 encoded word for O(1) lookup.
+///
+/// Cache-friendly packed layout:
+/// - `presence`: bitfield (2.7 KB for word_size=3) — fits in L1, quick rejection
+/// - `offsets`: compact offset table (86 KB) — fits in L2
+/// - `hits`: flat packed array of all query positions
+///
+/// For word_size=3 the naive Vec<Vec<u32>> layout uses 514 KB (doesn't fit in L2),
+/// causing cache misses on every subject word lookup. This packed layout reduces
+/// working set by ~6x.
 pub struct ProteinLookup {
-    /// word_size: typically 3
     pub word_size: usize,
-    /// Flat lookup: table[word_code] = list of query positions.
-    /// Size = 28^word_size (e.g. 21,952 for word_size=3).
-    pub table: Vec<Vec<u32>>,
-    /// Total number of entries (28^word_size)
+    /// Presence bitfield: bit `code` is set if any query word matches word `code`.
+    presence: Vec<u64>,
+    /// offsets[code] = start index into `hits` for word `code`.
+    /// offsets[capacity] = total length of `hits` (sentinel). Used during build.
+    #[allow(dead_code)]
+    offsets: Vec<u32>,
+    /// Flat packed array of query positions for all words, concatenated.
+    hits: Vec<u32>,
+    /// For direct indexing from search loop: table[code] = slice into hits.
+    /// This is a Vec of (start, len) pairs, 8 bytes each = 171 KB for word_size=3.
+    /// Still better than 514 KB for Vec<Vec<u32>>.
+    pub table: Vec<(u32, u32)>, // (offset, length)
     capacity: usize,
 }
 
@@ -30,30 +45,92 @@ impl ProteinLookup {
     /// Includes neighboring words scoring >= threshold.
     pub fn build(query: &[u8], word_size: usize, matrix: &ScoringMatrix, threshold: i32) -> Self {
         let capacity = 28usize.pow(word_size as u32);
-        let mut table = vec![Vec::new(); capacity];
         let qlen = query.len();
+
         if qlen < word_size {
-            return ProteinLookup { word_size, table, capacity };
+            return ProteinLookup {
+                word_size,
+                presence: vec![0u64; capacity.div_ceil(64)],
+                offsets: vec![0u32; capacity + 1],
+                hits: Vec::new(),
+                table: vec![(0, 0); capacity],
+                capacity,
+            };
         }
 
-        // For each position in the query, find all neighbor words
+        // Phase 1: collect hits into temporary Vec<Vec<u32>> (build phase only)
+        let mut tmp = vec![Vec::new(); capacity];
         for q_pos in 0..=(qlen - word_size) {
             let query_word = &query[q_pos..q_pos + word_size];
-            // Enumerate neighboring words
             enumerate_neighbors(query_word, word_size, matrix, threshold, &mut |neighbor_code| {
-                table[neighbor_code as usize].push(q_pos as u32);
+                tmp[neighbor_code as usize].push(q_pos as u32);
             });
         }
 
-        ProteinLookup { word_size, table, capacity }
+        // Phase 2: pack into flat arrays
+        let mut presence = vec![0u64; capacity.div_ceil(64)];
+        let mut offsets = vec![0u32; capacity + 1];
+        let mut total = 0u32;
+        for code in 0..capacity {
+            offsets[code] = total;
+            let len = tmp[code].len() as u32;
+            if len > 0 {
+                presence[code / 64] |= 1u64 << (code % 64);
+            }
+            total += len;
+        }
+        offsets[capacity] = total;
+
+        let mut hits = vec![0u32; total as usize];
+        for code in 0..capacity {
+            let start = offsets[code] as usize;
+            for (i, &pos) in tmp[code].iter().enumerate() {
+                hits[start + i] = pos;
+            }
+        }
+
+        // Build table for direct indexing
+        let table: Vec<(u32, u32)> = (0..capacity)
+            .map(|code| {
+                let start = offsets[code];
+                let len = offsets[code + 1] - start;
+                (start, len)
+            })
+            .collect();
+
+        ProteinLookup { word_size, presence, offsets, hits, table, capacity }
+    }
+
+    /// Get the hit slice for a word code. Returns empty slice if no hits.
+    #[inline]
+    pub fn get_hits(&self, code: u32) -> &[u32] {
+        let code = code as usize;
+        if code < self.capacity {
+            // Quick presence check (L1 cache — 2.7 KB bitfield)
+            let word = code / 64;
+            let bit = code % 64;
+            if self.presence[word] & (1u64 << bit) == 0 {
+                return &[];
+            }
+            let (start, len) = self.table[code];
+            &self.hits[start as usize..(start + len) as usize]
+        } else {
+            &[]
+        }
     }
 
     /// Look up query positions for a subject word (Ncbistdaa encoded).
+    /// Kept for backward compatibility with tblastn/tblastx/psiblast.
     #[inline]
-    pub fn lookup(&self, subject_word: &[u8]) -> Option<&Vec<u32>> {
+    pub fn lookup(&self, subject_word: &[u8]) -> Option<&[u32]> {
         let code = encode_protein_word(subject_word) as usize;
-        if code < self.capacity && !self.table[code].is_empty() {
-            Some(&self.table[code])
+        if code < self.capacity {
+            let (start, len) = self.table[code];
+            if len > 0 {
+                Some(&self.hits[start as usize..(start + len) as usize])
+            } else {
+                None
+            }
         } else {
             None
         }

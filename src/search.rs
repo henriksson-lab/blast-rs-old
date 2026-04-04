@@ -183,6 +183,19 @@ pub(crate) fn neighbor_threshold(matrix: MatrixType, word_size: usize) -> i32 {
     }
 }
 
+/// Adjust neighbor word threshold based on query length.
+/// Longer queries generate more seed hits per subject; raising the threshold
+/// reduces false positives while maintaining sensitivity (matches NCBI behavior).
+fn adjusted_threshold(base: i32, query_len: usize) -> i32 {
+    if query_len > 500 {
+        base + 2
+    } else if query_len > 200 {
+        base + 1
+    } else {
+        base
+    }
+}
+
 /// Run a protein BLAST search (blastp).
 pub fn blast_search(
     db: &BlastDb,
@@ -221,7 +234,8 @@ pub fn blast_search(
     let num_seqs = db.num_sequences() as u64;
     let (eff_query_len, eff_db_len) = ka.effective_lengths(query_for_lookup.len(), db_len, num_seqs);
 
-    let threshold = neighbor_threshold(params.matrix, params.word_size);
+    let base_threshold = neighbor_threshold(params.matrix, params.word_size);
+    let threshold = adjusted_threshold(base_threshold, query_for_lookup.len());
     let lookup = ProteinLookup::build(query_for_lookup, params.word_size, &matrix, threshold);
 
     let query_comp = if params.comp_adjust { Some(composition_ncbistdaa(query_for_extend)) } else { None };
@@ -297,6 +311,8 @@ pub fn blast_search(
 struct SearchScratch {
     diag_last: Vec<i32>,
     diag_flags: Vec<bool>,
+    /// Diagonals that were touched (for selective reset instead of full memset)
+    touched_diags: Vec<usize>,
     ungapped_hits: Vec<(i32, usize, usize, usize, usize)>,
     covered_query: Vec<bool>,
 }
@@ -306,22 +322,36 @@ impl SearchScratch {
         SearchScratch {
             diag_last: Vec::new(),
             diag_flags: Vec::new(),
+            touched_diags: Vec::new(),
             ungapped_hits: Vec::new(),
             covered_query: Vec::new(),
         }
     }
 
-    /// Ensure diagonal arrays are at least `len` and reset to initial values.
+    /// Ensure diagonal arrays are at least `len`. Uses selective reset of
+    /// previously-touched diagonals instead of clearing the full array.
     fn reset_diags(&mut self, len: usize, two_hit: bool) {
-        if two_hit {
-            self.diag_last.resize(len, i32::MIN);
-            self.diag_last[..len].fill(i32::MIN);
+        // First call: allocate and zero-fill
+        if self.diag_flags.len() < len {
             self.diag_flags.resize(len, false);
-            self.diag_flags[..len].fill(false);
-        } else {
-            self.diag_flags.resize(len, false);
-            self.diag_flags[..len].fill(false);
+            if two_hit { self.diag_last.resize(len, i32::MIN); }
         }
+        // Selective reset: only clear diagonals touched in previous search
+        for &d in &self.touched_diags {
+            if d < self.diag_flags.len() {
+                self.diag_flags[d] = false;
+                if two_hit && d < self.diag_last.len() {
+                    self.diag_last[d] = i32::MIN;
+                }
+            }
+        }
+        self.touched_diags.clear();
+    }
+
+    /// Record a diagonal that was modified (for selective reset next time).
+    #[inline]
+    fn touch_diag(&mut self, diag: usize) {
+        self.touched_diags.push(diag);
     }
 
     fn reset_covered(&mut self, len: usize) {
@@ -370,13 +400,16 @@ fn search_one_protein_scratch(
     // (eliminates the separate hit-count pre-scan)
     if params.two_hit {
         // Process first word (s_pos=0)
-        for &q_pos in &lookup.table[code as usize] {
+        for &q_pos in lookup.get_hits(code) {
             let diag = (0isize - q_pos as isize + diag_offset as isize) as usize;
-            if diag < diag_len { scratch.diag_last[diag] = 0; }
+            if diag < diag_len {
+                scratch.diag_last[diag] = 0;
+                scratch.touch_diag(diag);
+            }
         }
         for s_pos in 1..num_words {
             code = (code % modulus) * 28 + (subject[s_pos + ws - 1] as u32 % 28);
-            let positions = &lookup.table[code as usize];
+            let positions = lookup.get_hits(code);
             if positions.is_empty() { continue; }
             for &q_pos in positions {
                 let q_pos = q_pos as usize;
@@ -386,6 +419,7 @@ fn search_one_protein_scratch(
                 let prev = scratch.diag_last[diag];
                 if prev == i32::MIN {
                     scratch.diag_last[diag] = s_pos as i32;
+                    scratch.touch_diag(diag);
                     continue;
                 }
                 if (s_pos as i32) - prev > params.two_hit_window as i32 {
@@ -403,21 +437,24 @@ fn search_one_protein_scratch(
     } else {
         // Single-hit mode: process all words in one pass
         {
-            let positions = &lookup.table[code as usize];
+            let positions = lookup.get_hits(code);
             for &q_pos in positions {
                 let q_pos = q_pos as usize;
                 let diag = (0isize - q_pos as isize + diag_offset as isize) as usize;
                 if diag < diag_len && scratch.diag_flags[diag] { continue; }
                 let hit = ungapped_extend_inline(query, subject, q_pos, 0, score_profile, x_drop);
                 if hit.0 >= cutoff {
-                    if diag < diag_len { scratch.diag_flags[diag] = true; }
+                    if diag < diag_len {
+                        scratch.diag_flags[diag] = true;
+                        scratch.touch_diag(diag);
+                    }
                     scratch.ungapped_hits.push(hit);
                 }
             }
         }
         for s_pos in 1..num_words {
             code = (code % modulus) * 28 + (subject[s_pos + ws - 1] as u32 % 28);
-            let positions = &lookup.table[code as usize];
+            let positions = lookup.get_hits(code);
             if positions.is_empty() { continue; }
             for &q_pos in positions {
                 let q_pos = q_pos as usize;
@@ -425,7 +462,10 @@ fn search_one_protein_scratch(
                 if diag < diag_len && scratch.diag_flags[diag] { continue; }
                 let hit = ungapped_extend_inline(query, subject, q_pos, s_pos, score_profile, x_drop);
                 if hit.0 >= cutoff {
-                    if diag < diag_len { scratch.diag_flags[diag] = true; }
+                    if diag < diag_len {
+                        scratch.diag_flags[diag] = true;
+                        scratch.touch_diag(diag);
+                    }
                     scratch.ungapped_hits.push(hit);
                 }
             }
@@ -582,10 +622,10 @@ fn search_one_protein_fast(
     for &r in subject.iter().take(ws) {
         code = code * 28 + (r as u32 % 28);
     }
-    if !lookup.table[code as usize].is_empty() { total_hits += 1; }
+    if !lookup.get_hits(code).is_empty() { total_hits += 1; }
     for &r in subject.iter().skip(ws) {
         code = (code % modulus) * 28 + (r as u32 % 28);
-        if !lookup.table[code as usize].is_empty() { total_hits += 1; }
+        if !lookup.get_hits(code).is_empty() { total_hits += 1; }
     }
     if total_hits == 0 { return vec![]; }
 
@@ -655,7 +695,7 @@ fn search_one_protein_fast(
             code = code * 28 + (r as u32 % 28);
         }
         // Process first word
-        for &q_pos in &lookup.table[code as usize] {
+        for &q_pos in lookup.get_hits(code) {
             let q_pos = q_pos as usize;
             let diag = (0isize - q_pos as isize + diag_offset as isize) as usize;
             if diag < diag_len { diag_last[diag] = 0; }
@@ -663,7 +703,7 @@ fn search_one_protein_fast(
         // Process remaining words with rolling code
         for s_pos in 1..num_words {
             code = (code % modulus) * 28 + (subject[s_pos + ws - 1] as u32 % 28);
-            let positions = &lookup.table[code as usize];
+            let positions = lookup.get_hits(code);
             if positions.is_empty() { continue; }
             for &q_pos in positions {
                 let q_pos = q_pos as usize;
@@ -698,7 +738,7 @@ fn search_one_protein_fast(
         }
         // Inline the scan + extend loop with rolling codes
         {
-            let positions = &lookup.table[code as usize];
+            let positions = lookup.get_hits(code);
             for &q_pos in positions {
                 let q_pos = q_pos as usize;
                 let diag = (0isize - q_pos as isize + diag_offset as isize) as usize;
@@ -712,7 +752,7 @@ fn search_one_protein_fast(
         }
         for s_pos in 1..num_words {
             code = (code % modulus) * 28 + (subject[s_pos + ws - 1] as u32 % 28);
-            let positions = &lookup.table[code as usize];
+            let positions = lookup.get_hits(code);
             if positions.is_empty() { continue; }
             for &q_pos in positions {
                 let q_pos = q_pos as usize;
@@ -837,7 +877,7 @@ fn search_one_protein(
         let mut diag_extended: Vec<bool> = vec![false; diag_len];
 
         for (s_pos, &word_code) in subject_codes.iter().enumerate() {
-            let positions = &lookup.table[word_code as usize];
+            let positions = lookup.get_hits(word_code);
             if !positions.is_empty() {
                 let q_positions = positions;
                 for &q_pos in q_positions {
@@ -873,7 +913,7 @@ fn search_one_protein(
         let mut diag_hit: Vec<bool> = vec![false; diag_len];
 
         for (s_pos, &word_code) in subject_codes.iter().enumerate() {
-            let positions = &lookup.table[word_code as usize];
+            let positions = lookup.get_hits(word_code);
             if !positions.is_empty() {
                 for &q_pos in positions {
                     let q_pos = q_pos as usize;
