@@ -138,7 +138,7 @@ static NA4_TO_IUPAC: [u8; 16] = [
     b'N', // 1111 = any
 ];
 
-fn apply_ambiguities(bases: &mut Vec<u8>, ambig_data: &[u8]) {
+fn apply_ambiguities(bases: &mut [u8], ambig_data: &[u8]) {
     if ambig_data.len() < 4 {
         return;
     }
@@ -188,7 +188,7 @@ fn apply_ambiguities(bases: &mut Vec<u8>, ambig_data: &[u8]) {
 
 /// Return the raw Ncbistdaa bytes for a protein OID.
 /// The caller ensures start < end and the data slice is the full psq file.
-pub fn get_protein_raw<'a>(psq: &'a [u8], start: usize, end: usize) -> &'a [u8] {
+pub fn get_protein_raw(psq: &[u8], start: usize, end: usize) -> &[u8] {
     // end offset points to the NUL byte separator; sequence is start..end-1
     if end == 0 || start >= psq.len() {
         return &[];

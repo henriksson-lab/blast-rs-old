@@ -322,18 +322,16 @@ pub fn parse_def_line_set(data: &[u8]) -> Result<Vec<BlastDefLine>> {
         };
         cur = rest;
         if tag2 == 0x30 {
-            match parse_def_line(inner) {
-                Ok(dl) => result.push(dl),
-                Err(_) => {} // skip malformed deflines
+            if let Ok(dl) = parse_def_line(inner) {
+                result.push(dl);
             }
         }
     }
 
     if result.is_empty() {
         // Try parsing as a single defline without the outer set wrapper
-        match parse_def_line(content) {
-            Ok(dl) => result.push(dl),
-            Err(_) => {}
+        if let Ok(dl) = parse_def_line(content) {
+            result.push(dl);
         }
     }
 

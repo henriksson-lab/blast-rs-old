@@ -275,6 +275,7 @@ pub fn blast_search(
 }
 
 /// Search one protein subject sequence.
+#[allow(clippy::too_many_arguments)]
 fn search_one_protein(
     query: &[u8],
     subject: &[u8],
@@ -289,6 +290,21 @@ fn search_one_protein(
     let ws = lookup.word_size;
     if slen < ws { return vec![]; }
 
+    // Precompute rolling word codes for the subject to avoid per-position re-encoding
+    let modulus = 28u32.pow(ws as u32 - 1);
+    let mut subject_codes: Vec<u32> = Vec::with_capacity(slen - ws + 1);
+    {
+        let mut code = 0u32;
+        for &r in subject.iter().take(ws) {
+            code = code * 28 + (r as u32 % 28);
+        }
+        subject_codes.push(code);
+        for &r in subject.iter().skip(ws) {
+            code = (code % modulus) * 28 + (r as u32 % 28);
+            subject_codes.push(code);
+        }
+    }
+
     let diag_offset = query.len();
     let diag_len = query.len() + slen + 1;
     let mut ungapped_hits = Vec::new();
@@ -298,9 +314,10 @@ fn search_one_protein(
         let mut diag_last: Vec<i32> = vec![i32::MIN; diag_len];
         let mut diag_extended: Vec<bool> = vec![false; diag_len];
 
-        for s_pos in 0..=(slen - ws) {
-            let word = &subject[s_pos..s_pos + ws];
-            if let Some(q_positions) = lookup.lookup(word) {
+        for (s_pos, &word_code) in subject_codes.iter().enumerate() {
+            let positions = &lookup.table[word_code as usize];
+            if !positions.is_empty() {
+                let q_positions = positions;
                 for &q_pos in q_positions {
                     let q_pos = q_pos as usize;
                     let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
@@ -333,10 +350,10 @@ fn search_one_protein(
         // Single-hit mode (original behavior)
         let mut diag_hit: Vec<bool> = vec![false; diag_len];
 
-        for s_pos in 0..=(slen - ws) {
-            let word = &subject[s_pos..s_pos + ws];
-            if let Some(q_positions) = lookup.lookup(word) {
-                for &q_pos in q_positions {
+        for (s_pos, &word_code) in subject_codes.iter().enumerate() {
+            let positions = &lookup.table[word_code as usize];
+            if !positions.is_empty() {
+                for &q_pos in positions {
                     let q_pos = q_pos as usize;
                     let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
                     if diag < diag_hit.len() && diag_hit[diag] {
@@ -407,8 +424,8 @@ fn search_one_protein(
         // Mark covered region
         let cover_start = gh.q_start.min(covered_query.len());
         let cover_end = gh.q_end.min(covered_query.len());
-        for i in cover_start..cover_end {
-            covered_query[i] = true;
+        for item in covered_query.iter_mut().take(cover_end).skip(cover_start) {
+            *item = true;
         }
 
         // Convert alignment to ASCII for display
@@ -694,9 +711,9 @@ fn build_nt_matrix(match_score: i32, mismatch: i32) -> ScoringMatrix {
     // Since 28 is too small for ASCII, we'll use a trick: map through nt_to_2bit.
     // For simplicity, just use the ScoringMatrix with ncbi2bit encoding in query/subject.
     // Set diagonal entries for 2-bit codes 0,1,2,3 (A,C,G,T):
-    for i in 0..4usize {
-        for j in 0..4usize {
-            scores[i][j] = if i == j { match_score } else { mismatch };
+    for (i, row) in scores.iter_mut().enumerate().take(4) {
+        for (j, cell) in row.iter_mut().enumerate().take(4) {
+            *cell = if i == j { match_score } else { mismatch };
         }
     }
     ScoringMatrix {

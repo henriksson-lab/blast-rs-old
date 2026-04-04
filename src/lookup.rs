@@ -1,18 +1,22 @@
 //! Lookup tables for k-mer seeding.
 
-use std::collections::HashMap;
 use crate::matrix::ScoringMatrix;
 
 /// Protein lookup table using neighboring words.
+/// Uses a flat array indexed by base-28 encoded word for O(1) lookup.
 pub struct ProteinLookup {
     /// word_size: typically 3
     pub word_size: usize,
-    /// map from encoded word to list of query positions
-    pub table: HashMap<u32, Vec<u32>>,
+    /// Flat lookup: table[word_code] = list of query positions.
+    /// Size = 28^word_size (e.g. 21,952 for word_size=3).
+    pub table: Vec<Vec<u32>>,
+    /// Total number of entries (28^word_size)
+    capacity: usize,
 }
 
 /// Encode a protein word of length `word_size` from Ncbistdaa residues.
 /// Uses base-28 encoding.
+#[inline]
 pub fn encode_protein_word(residues: &[u8]) -> u32 {
     let mut code = 0u32;
     for &r in residues {
@@ -25,33 +29,34 @@ impl ProteinLookup {
     /// Build lookup table from query (Ncbistdaa encoded).
     /// Includes neighboring words scoring >= threshold.
     pub fn build(query: &[u8], word_size: usize, matrix: &ScoringMatrix, threshold: i32) -> Self {
-        let mut table: HashMap<u32, Vec<u32>> = HashMap::new();
+        let capacity = 28usize.pow(word_size as u32);
+        let mut table = vec![Vec::new(); capacity];
         let qlen = query.len();
         if qlen < word_size {
-            return ProteinLookup { word_size, table };
+            return ProteinLookup { word_size, table, capacity };
         }
 
         // For each position in the query, find all neighbor words
         for q_pos in 0..=(qlen - word_size) {
             let query_word = &query[q_pos..q_pos + word_size];
-            // Self-score of query word
-            let self_score: i32 = query_word.iter().map(|&r| matrix.score(r, r)).sum();
-            if self_score < threshold {
-                // Even the query word itself doesn't meet threshold - unlikely but skip
-            }
             // Enumerate neighboring words
             enumerate_neighbors(query_word, word_size, matrix, threshold, &mut |neighbor_code| {
-                table.entry(neighbor_code).or_default().push(q_pos as u32);
+                table[neighbor_code as usize].push(q_pos as u32);
             });
         }
 
-        ProteinLookup { word_size, table }
+        ProteinLookup { word_size, table, capacity }
     }
 
     /// Look up query positions for a subject word (Ncbistdaa encoded).
+    #[inline]
     pub fn lookup(&self, subject_word: &[u8]) -> Option<&Vec<u32>> {
-        let code = encode_protein_word(subject_word);
-        self.table.get(&code)
+        let code = encode_protein_word(subject_word) as usize;
+        if code < self.capacity && !self.table[code].is_empty() {
+            Some(&self.table[code])
+        } else {
+            None
+        }
     }
 }
 
@@ -63,20 +68,36 @@ fn enumerate_neighbors(
     threshold: i32,
     callback: &mut impl FnMut(u32),
 ) {
-    // Recursive enumeration
-    let mut current = vec![0u8; word_size];
-    enumerate_rec(query_word, word_size, matrix, threshold, 0, 0, 0, &mut current, callback);
+    // Precompute suffix max scores: max_suffix[i] = max possible score from positions i..word_size
+    // This avoids recomputing at every recursive call.
+    let mut max_suffix = vec![0i32; word_size + 1];
+    for i in (0..word_size).rev() {
+        let q = query_word[i];
+        let best = (0u8..28).map(|r| matrix.score(q, r)).max().unwrap_or(0);
+        max_suffix[i] = max_suffix[i + 1] + best;
+    }
+
+    // Precompute score rows: for each query position, the score for each possible residue
+    let mut score_rows = vec![[0i32; 28]; word_size];
+    for (i, row) in score_rows.iter_mut().enumerate() {
+        let q = query_word[i];
+        for r in 0u8..28 {
+            row[r as usize] = matrix.score(q, r);
+        }
+    }
+
+    enumerate_rec(&score_rows, &max_suffix, word_size, threshold, 0, 0, 0, callback);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn enumerate_rec(
-    query_word: &[u8],
+    score_rows: &[[i32; 28]],
+    max_suffix: &[i32],
     word_size: usize,
-    matrix: &ScoringMatrix,
     threshold: i32,
     pos: usize,
     current_score: i32,
     current_code: u32,
-    current: &mut Vec<u8>,
     callback: &mut impl FnMut(u32),
 ) {
     if pos == word_size {
@@ -86,35 +107,28 @@ fn enumerate_rec(
         return;
     }
 
-    // Upper bound: max possible score from remaining positions
-    let _remaining = word_size - pos;
-    let mut max_remaining = 0i32;
-    for p in pos..word_size {
-        let q = query_word[p];
-        let max_score = (0u8..28).map(|r| matrix.score(q, r)).max().unwrap_or(0);
-        max_remaining += max_score;
-    }
-
     // Prune: even with best possible remaining scores, can't reach threshold
-    if current_score + max_remaining < threshold {
+    if current_score + max_suffix[pos] < threshold {
         return;
     }
 
-    let q = query_word[pos];
+    let scores = &score_rows[pos];
     for r in 0u8..28 {
-        let s = matrix.score(q, r);
+        let s = scores[r as usize];
         let new_score = current_score + s;
+        // Per-residue pruning: check if this choice can still reach threshold
+        if new_score + max_suffix[pos + 1] < threshold {
+            continue;
+        }
         let new_code = current_code * 28 + r as u32;
-        current[pos] = r;
         enumerate_rec(
-            query_word,
+            score_rows,
+            max_suffix,
             word_size,
-            matrix,
             threshold,
             pos + 1,
             new_score,
             new_code,
-            current,
             callback,
         );
     }
@@ -146,19 +160,19 @@ impl NucleotideLookup {
         let mut word_code: u32 = 0;
         let mask = (capacity - 1) as u32;
 
-        for i in 0..word_size - 1 {
-            if encoded[i] > 3 {
+        for &b in encoded.iter().take(word_size - 1) {
+            if b > 3 {
                 // Ambiguous base — reset
                 word_code = 0;
                 continue;
             }
-            word_code = ((word_code << 2) | encoded[i] as u32) & mask;
+            word_code = ((word_code << 2) | b as u32) & mask;
         }
 
         let mut valid = true;
         // Check if first word_size-1 bases are valid
-        for i in 0..word_size - 1 {
-            if encoded[i] > 3 { valid = false; break; }
+        for &b in encoded.iter().take(word_size - 1) {
+            if b > 3 { valid = false; break; }
         }
 
         for i in word_size - 1..query.len() {
@@ -173,9 +187,9 @@ impl NucleotideLookup {
                 let start = i + 1 - word_size;
                 valid = true;
                 word_code = 0;
-                for j in start..=i {
-                    if encoded[j] > 3 { valid = false; break; }
-                    word_code = ((word_code << 2) | encoded[j] as u32) & mask;
+                for &eb in encoded.iter().take(i + 1).skip(start) {
+                    if eb > 3 { valid = false; break; }
+                    word_code = ((word_code << 2) | eb as u32) & mask;
                 }
                 if !valid { continue; }
             } else {
@@ -206,13 +220,13 @@ impl NucleotideLookup {
         let mut word_code: u32 = 0;
         let mut valid = true;
 
-        for i in 0..ws - 1 {
-            if encoded[i] > 3 { valid = false; word_code = 0; continue; }
-            word_code = ((word_code << 2) | encoded[i] as u32) & mask;
+        for &b in encoded.iter().take(ws - 1) {
+            if b > 3 { valid = false; word_code = 0; continue; }
+            word_code = ((word_code << 2) | b as u32) & mask;
         }
         // Recheck first window validity
-        for i in 0..ws - 1 {
-            if encoded[i] > 3 { valid = false; break; }
+        for &b in encoded.iter().take(ws - 1) {
+            if b > 3 { valid = false; break; }
         }
 
         for i in ws - 1..encoded.len() {
@@ -226,9 +240,9 @@ impl NucleotideLookup {
                 let start = i + 1 - ws;
                 valid = true;
                 word_code = 0;
-                for j in start..=i {
-                    if encoded[j] > 3 { valid = false; break; }
-                    word_code = ((word_code << 2) | encoded[j] as u32) & mask;
+                for &eb in encoded.iter().take(i + 1).skip(start) {
+                    if eb > 3 { valid = false; break; }
+                    word_code = ((word_code << 2) | eb as u32) & mask;
                 }
                 if !valid { continue; }
             } else {

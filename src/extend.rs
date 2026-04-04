@@ -108,6 +108,7 @@ pub struct GappedHit {
 ///
 /// This implements the standard BLAST gapped extension starting from a "seed" hit.
 /// We extend from a center point (q_center, s_center) bidirectionally.
+#[allow(clippy::too_many_arguments)]
 pub fn gapped_extend(
     query: &[u8],
     subject: &[u8],
@@ -151,9 +152,6 @@ pub fn gapped_extend(
     let mut query_aln = Vec::new();
     let mut midline = Vec::new();
     let mut subject_aln = Vec::new();
-    let num_identities;
-    let num_gaps;
-
     // Left part (reversed)
     let mut left_q_aln: Vec<u8> = left.query_aln.iter().rev().cloned().collect();
     let mut left_m_aln: Vec<u8> = left.midline.iter().rev().cloned().collect();
@@ -167,8 +165,8 @@ pub fn gapped_extend(
     midline.extend_from_slice(&right.midline);
     subject_aln.extend_from_slice(&right.subject_aln);
 
-    num_identities = midline.iter().filter(|&&c| c == b'|').count();
-    num_gaps = query_aln.iter().filter(|&&c| c == b'-').count()
+    let num_identities = midline.iter().filter(|&&c| c == b'|').count();
+    let num_gaps = query_aln.iter().filter(|&&c| c == b'-').count()
         + subject_aln.iter().filter(|&&c| c == b'-').count();
 
     GappedHit {
@@ -247,15 +245,26 @@ fn extend_one_direction(
     }
     h[0] = 0;
 
+    // Precompute query score profile: profile[i][r] = score of query[i] vs residue r
+    // Eliminates per-cell bounds-checked matrix lookup in the inner loop.
+    let profile: Vec<[i32; 28]> = query.iter().map(|&q| {
+        let mut row = [matrix.min_score; 28];
+        for r in 0u8..28 {
+            row[r as usize] = matrix.score(q, r);
+        }
+        row
+    }).collect();
+
     let mut best_score = 0i32;
     let mut best_i = 0usize;
     let mut best_j = 0usize;
 
     for i in 1..rows {
+        let q_profile = &profile[i - 1];
         for j in 1..cols {
             let idx = i * cols + j;
             let diag = h[(i-1) * cols + (j-1)];
-            let s = matrix.score(query[i-1], subject[j-1]);
+            let s = q_profile[subject[j-1] as usize % 28];
             let match_score = if diag == NEG_INF { NEG_INF } else { diag + s };
 
             // E[i][j] = max(H[i][j-1] - gap_open - gap_extend, E[i][j-1] - gap_extend)
@@ -367,7 +376,7 @@ pub fn ungapped_extend_nucleotide(
 ) -> UngappedHit {
     // Use a simple scoring: treat query/subject as ASCII nucleotides
     let score_fn = |a: u8, b: u8| -> i32 {
-        if a.to_ascii_uppercase() == b.to_ascii_uppercase() {
+        if a.eq_ignore_ascii_case(&b) {
             match_score
         } else {
             mismatch

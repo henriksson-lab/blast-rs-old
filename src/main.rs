@@ -783,7 +783,7 @@ fn parse_matrix(matrix: &str) -> MatrixType {
     })
 }
 
-fn open_db(db: &PathBuf) -> BlastDb {
+fn open_db(db: &Path) -> BlastDb {
     BlastDb::open(db).unwrap_or_else(|e| {
         eprintln!("Error opening database: {}", e);
         std::process::exit(1);
@@ -1402,12 +1402,12 @@ fn read_fasta(path: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
         let line = line?;
         let line = line.trim().to_string();
         if line.is_empty() { continue; }
-        if line.starts_with('>') {
+        if let Some(stripped) = line.strip_prefix('>') {
             if !current_title.is_empty() {
                 sequences.push((current_title.clone(), current_seq.clone()));
                 current_seq.clear();
             }
-            current_title = line[1..].to_string();
+            current_title = stripped.to_string();
         } else {
             current_seq.extend_from_slice(line.as_bytes());
         }

@@ -260,6 +260,67 @@ Karlin-Altschul parameters are pre-computed for standard gap penalty combination
 | `clap` | CLI argument parsing |
 | `thiserror` | Error types |
 
+## Performance benchmarks
+
+Measured with `cargo bench` (Criterion) on a single run. Database sequences are ~300aa (protein) or ~1000bp (nucleotide), randomly generated.
+
+| Benchmark | Time | Description |
+|-----------|------|-------------|
+| **Lookup table construction** | | |
+| protein_lookup_build (300aa) | 4.6 ms | Neighbor word enumeration, BLOSUM62, word_size=3 |
+| nucleotide_lookup_build (1000bp) | 78 ms | Exact word hashing, word_size=11 |
+| **Extension** | | |
+| ungapped_extend (300aa) | 40 ns | X-drop ungapped protein extension |
+| gapped_extend (300aa, identical) | 427 µs | Full Smith-Waterman DP with traceback |
+| ungapped_extend_nt (1000bp) | 76 ns | X-drop ungapped nucleotide extension |
+| **End-to-end search** | | |
+| blastp, 100 seqs, 1 thread | 288 ms | 300aa query vs 100×300aa DB |
+| blastp, 1000 seqs, 1 thread | 2.86 s | 300aa query vs 1000×300aa DB |
+| blastp, 1000 seqs, 4 threads | 2.86 s | Same, with Rayon parallelism |
+| blastn, 100 seqs, 1 thread | 226 ms | 500bp query vs 100×1000bp DB |
+| blastn, 1000 seqs, 1 thread | 243 ms | 500bp query vs 1000×1000bp DB |
+| **Masking** | | |
+| SEG (1000aa) | 215 µs | Low-complexity protein masking |
+| DUST (10000bp) | 2.6 ms | Low-complexity nucleotide masking |
+| **Misc** | | |
+| six_frame_translate (3000bp) | 215 µs | All 6 reading frames |
+| db_build (1000 protein seqs) | 2.2 ms | Write v4 database (1000×300aa) |
+
+Run benchmarks yourself:
+
+```sh
+cargo bench
+```
+
+HTML reports are generated in `target/criterion/`.
+
+### Comparison with NCBI BLAST+ (blastp)
+
+Measured on synthetic protein databases (sequences ~300aa). Both tools find the same number of hits. NCBI BLAST+ 2.17.0, single-threaded unless noted.
+
+| Query | DB size | NCBI BLAST+ | blast-rs | Ratio | Hits |
+|-------|---------|-------------|----------|-------|------|
+| 50aa  | 100     | 0.04 s      | 0.24 s   | 6x    | 5    |
+| 50aa  | 1000    | 0.06 s      | 2.21 s   | 37x   | 5    |
+| 300aa | 100     | 0.06 s      | 7.92 s   | 132x  | 5    |
+| 300aa | 1000    | 0.07 s      | 78.6 s   | 1123x | 5    |
+| 1000aa| 100     | 0.07 s      | 78.1 s   | 1115x | 20   |
+
+Multi-threaded scaling (300aa query, 1000 seq DB):
+
+| Threads | NCBI BLAST+ | blast-rs | Ratio |
+|---------|-------------|----------|-------|
+| 1       | 0.07 s      | 78.6 s   | 1123x |
+| 2       | 0.09 s      | 40.6 s   | 452x  |
+| 4       | 0.07 s      | 21.0 s   | 300x  |
+| 8       | 0.07 s      | 11.2 s   | 160x  |
+
+blast-rs is significantly slower than NCBI BLAST+, especially for longer queries. Memory usage is much lower (~6 MB vs ~37 MB). The main bottlenecks are:
+
+1. **Lookup table** -- NCBI uses precomputed tables and SIMD; blast-rs does brute-force neighbor word enumeration
+2. **Gapped extension** -- NCBI uses banded Smith-Waterman with SIMD; blast-rs does full O(m*n) DP
+3. **Cache optimization** -- NCBI has 20+ years of low-level tuning
+
 ## License
 
 MIT

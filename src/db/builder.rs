@@ -255,6 +255,7 @@ impl BlastDbBuilder {
 
 // ─── Index file serialisation ────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn build_index(
     seq_type: SeqType,
     title: &str,

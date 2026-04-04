@@ -65,6 +65,7 @@ pub struct SearchContext<'a> {
     pub db_num_seqs: u64,
     pub db_len: u64,
     pub query_title: &'a str,
+    #[allow(dead_code)]
     pub query_seq: &'a [u8],
     pub query_len: usize,
     pub matrix: &'a str,
@@ -104,6 +105,7 @@ pub fn write_results(
         15 => fmt15_json(out, ctx, results),
         16 => fmt16_xml2(out, ctx, results),
         17 => fmt17_fasta(out, ctx, results, db),
+        19 => write_results_html(out, ctx, results),
         _ => writeln!(out, "# Unknown output format {}.", fmt.fmt_id),
     }
 }
@@ -144,7 +146,7 @@ fn fmt0_pairwise(
     query_anchored: bool,    // true → formats 1/2
     positive_marks: bool,    // true → format 2 (use '+' for all conserved, no '|')
 ) -> io::Result<()> {
-    let qid = first_word(ctx.query_title);
+    let _qid = first_word(ctx.query_title);
 
     writeln!(out, "BLAST{} {}  Reference: Rust BLAST implementation", if query_anchored {"X"} else {""}, ctx.program.to_uppercase())?;
     writeln!(out)?;
@@ -199,7 +201,7 @@ fn fmt34_flat(
     results: &[SearchResult],
     positive_marks: bool,
 ) -> io::Result<()> {
-    let qid = first_word(ctx.query_title);
+    let _qid = first_word(ctx.query_title);
     writeln!(out, "Query= {} ({} letters)", ctx.query_title, ctx.query_len)?;
     writeln!(out)?;
 
@@ -759,11 +761,11 @@ fn ber_integer(val: i64) -> Vec<u8> {
                 v >>= 8;
             }
             // ensure high bit clear for positive
-            if stack.last().map_or(false, |&b| b & 0x80 != 0) {
+            if stack.last().is_some_and(|&b| b & 0x80 != 0) {
                 stack.push(0);
             }
         } else {
-            while v < -1 || (stack.last().map_or(true, |&b| b & 0x80 == 0)) {
+            while v < -1 || (stack.last().is_none_or(|&b| b & 0x80 == 0)) {
                 stack.push((v & 0xFF) as u8);
                 v >>= 8;
                 if stack.len() > 8 { break; }
@@ -796,16 +798,16 @@ fn ber_visiblestring(s: &str) -> Vec<u8> {
 /// BER ENUMERATED.
 fn ber_enumerated(val: i32) -> Vec<u8> {
     let mut bytes = Vec::new();
-    if val >= 0 && val < 128 {
+    if (0..128).contains(&val) {
         bytes.push(val as u8);
     } else {
         let mut v = val as i64;
         let mut stack = Vec::new();
         if val >= 0 {
             while v > 0 { stack.push((v & 0xFF) as u8); v >>= 8; }
-            if stack.last().map_or(false, |&b| b & 0x80 != 0) { stack.push(0); }
+            if stack.last().is_some_and(|&b| b & 0x80 != 0) { stack.push(0); }
         } else {
-            while v < -1 || stack.last().map_or(true, |&b| b & 0x80 == 0) {
+            while v < -1 || stack.last().is_none_or(|&b| b & 0x80 == 0) {
                 stack.push((v & 0xFF) as u8); v >>= 8;
                 if stack.len() > 4 { break; }
             }
@@ -819,11 +821,6 @@ fn ber_enumerated(val: i32) -> Vec<u8> {
 /// Wrap content with a context-specific constructed tag.
 fn ber_context(tag_num: u32, content: &[u8]) -> Vec<u8> {
     ber_tlv(2, true, tag_num, content) // CONTEXT-SPECIFIC, CONSTRUCTED
-}
-
-/// Wrap content with a context-specific primitive tag.
-fn ber_context_prim(tag_num: u32, content: &[u8]) -> Vec<u8> {
-    ber_tlv(2, false, tag_num, content)
 }
 
 /// BER SEQUENCE (UNIVERSAL 16 constructed).
@@ -1187,7 +1184,7 @@ fn fmt15_json(
 
         for (hj, hsp) in r.hsps.iter().enumerate() {
             let positives = count_positive_chars(&hsp.midline);
-            let mismatches = hsp.alignment_length.saturating_sub(hsp.num_identities + hsp.num_gaps);
+            let _mismatches = hsp.alignment_length.saturating_sub(hsp.num_identities + hsp.num_gaps);
             let comma_h = if hj + 1 < r.hsps.len() { "," } else { "" };
             writeln!(out, "                  {{")?;
             writeln!(out, "                    \"num\": {},", hj + 1)?;
@@ -1317,7 +1314,7 @@ fn fmt16_xml2(
 
 fn fmt17_fasta(
     out: &mut impl Write,
-    ctx: &SearchContext<'_>,
+    _ctx: &SearchContext<'_>,
     results: &[SearchResult],
     db: Option<&BlastDb>,
 ) -> io::Result<()> {
@@ -1378,7 +1375,7 @@ fn fmt18_sam(
 
             // MAPQ: derived from e-value (approximate)
             let mapq = if hsp.evalue <= 0.0 { 255 }
-                else { ((-10.0 * hsp.evalue.log10()).min(255.0).max(0.0)) as u8 };
+                else { ((-10.0 * hsp.evalue.log10()).clamp(0.0, 255.0)) as u8 };
 
             // Build CIGAR from alignment
             let cigar = build_cigar(&hsp.query_aln, &hsp.subject_aln);
@@ -1465,7 +1462,7 @@ pub fn write_results_html(
 // ─── Shared alignment helpers ───────────────────────────────────────────────
 
 /// Write the Score / Expect / Identity / Gaps header for one HSP.
-fn write_hsp_header(out: &mut impl Write, hsp: &Hsp, hsp_num: usize) -> io::Result<()> {
+fn write_hsp_header(out: &mut impl Write, hsp: &Hsp, _hsp_num: usize) -> io::Result<()> {
     writeln!(out, " Score = {:.1} bits ({}),  Expect = {:.2e}", hsp.bit_score, hsp.score, hsp.evalue)?;
     let positives = count_positive_chars(&hsp.midline);
     writeln!(out,
@@ -1507,8 +1504,7 @@ fn write_alignment_blocks(
             m_chunk.iter().map(|&c| {
                 if positive_marks {
                     // Format 2/4: '+' for identical, space for mismatch/gap
-                    if c == b'|' { b'+' }
-                    else if c == b'+' { b'+' }
+                    if c == b'|' || c == b'+' { b'+' }
                     else { b' ' }
                 } else {
                     // Format 1/3: '|' for identical, space for everything else

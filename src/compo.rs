@@ -50,7 +50,7 @@ pub fn composition_ncbistdaa(seq: &[u8]) -> [f64; 28] {
     let mut total = 0u64;
     for &c in seq {
         let idx = c as usize;
-        if idx >= 1 && idx <= 22 {
+        if (1..=22).contains(&idx) {
             counts[idx] += 1;
             total += 1;
         }
@@ -83,6 +83,7 @@ fn ascii_to_ncbistdaa(c: u8) -> u8 {
 }
 
 /// Compute the expected score Σᵢⱼ pᵢ·qⱼ·s[i][j] under background frequencies.
+#[allow(clippy::needless_range_loop)]
 fn expected_score(pq: &[f64; 28], rq: &[f64; 28], matrix: &ScoringMatrix) -> f64 {
     let mut mu = 0.0f64;
     for i in 1..23usize {
@@ -97,6 +98,7 @@ fn expected_score(pq: &[f64; 28], rq: &[f64; 28], matrix: &ScoringMatrix) -> f64
 ///
 /// Returns `None` if no positive λ' exists (e.g., the expected score is non-negative,
 /// meaning composition correction is not applicable).
+#[allow(clippy::needless_range_loop)]
 pub fn find_adjusted_lambda(
     q: &[f64; 28],
     r: &[f64; 28],
@@ -146,6 +148,7 @@ pub fn find_adjusted_lambda(
 /// Adjust an E-value using per-sequence composition correction (mode 1).
 ///
 /// Returns the adjusted E-value, or the original if correction is inapplicable.
+#[allow(clippy::too_many_arguments)]
 pub fn adjust_evalue(
     raw_evalue: f64,
     score: i32,
@@ -171,6 +174,7 @@ pub fn adjust_evalue(
 ///   1 = unconditional composition-based λ adjustment (original method)
 ///   2 = conditional: only apply if expected score diverges significantly from standard
 ///   3 = unconditional adjustment (same as 1 but always applied, even if expected_score ≥ 0)
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub fn adjust_evalue_with_mode(
     raw_evalue: f64,
     score: i32,
@@ -230,6 +234,7 @@ pub fn adjust_evalue_with_mode(
 }
 
 /// Expected score under background frequencies (for mode 2 comparison).
+#[allow(clippy::needless_range_loop)]
 fn expected_score_with_bg(matrix: &ScoringMatrix, _lambda: f64) -> f64 {
     let mut mu = 0.0f64;
     for i in 1..23usize {

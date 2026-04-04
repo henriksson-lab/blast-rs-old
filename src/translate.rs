@@ -8,12 +8,6 @@ pub fn nt_to_2bit(c: u8) -> u8 {
     }
 }
 
-/// Complement of a 2-bit-encoded base.
-#[inline]
-fn complement_2bit(b: u8) -> u8 {
-    match b { 0 => 3, 1 => 2, 2 => 1, 3 => 0, _ => 4 }
-}
-
 /// Complement of an ASCII nucleotide character.
 pub fn complement_ascii(c: u8) -> u8 {
     match c.to_ascii_uppercase() {

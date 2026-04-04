@@ -48,8 +48,8 @@ pub fn dust_mask(seq: &[u8], window: usize, threshold: f64) -> Vec<bool> {
         if end - start < 3 { break; }
         let score = dust_score_window(&bits[start..end]);
         if !score.is_nan() && score >= threshold {
-            for i in start..end {
-                masked[i] = true;
+            for item in masked.iter_mut().take(end).skip(start) {
+                *item = true;
             }
         }
     }
@@ -57,12 +57,12 @@ pub fn dust_mask(seq: &[u8], window: usize, threshold: f64) -> Vec<bool> {
 }
 
 /// Apply DUST masking in-place, replacing masked positions with `b'N'`.
-pub fn apply_dust(seq: &mut Vec<u8>) {
+pub fn apply_dust(seq: &mut [u8]) {
     apply_dust_opts(seq, DUST_WINDOW, DUST_THRESHOLD);
 }
 
 /// Apply DUST masking with custom parameters.
-pub fn apply_dust_opts(seq: &mut Vec<u8>, window: usize, threshold: f64) {
+pub fn apply_dust_opts(seq: &mut [u8], window: usize, threshold: f64) {
     let mask = dust_mask(seq, window, threshold);
     for (i, &m) in mask.iter().enumerate() {
         if m { seq[i] = b'N'; }
@@ -110,8 +110,8 @@ pub fn seg_mask(seq: &[u8], window: usize, k1: f64, k2: f64) -> Vec<bool> {
     let mut triggers: Vec<bool> = vec![false; n];
     for start in 0..=(n - window) {
         if seg_entropy(&seq[start..start + window]) < k1 {
-            for i in start..start + window {
-                triggers[i] = true;
+            for item in triggers.iter_mut().skip(start).take(window) {
+                *item = true;
             }
         }
     }
@@ -147,8 +147,8 @@ pub fn seg_mask(seq: &[u8], window: usize, k1: f64, k2: f64) -> Vec<bool> {
                 }
             }
 
-            for j in seg_start..seg_end {
-                masked[j] = true;
+            for item in masked.iter_mut().take(seg_end).skip(seg_start) {
+                *item = true;
             }
             i = seg_end;
         } else {
@@ -159,12 +159,12 @@ pub fn seg_mask(seq: &[u8], window: usize, k1: f64, k2: f64) -> Vec<bool> {
 }
 
 /// Apply SEG masking in-place, replacing masked positions with ASCII `b'X'`.
-pub fn apply_seg(seq: &mut Vec<u8>) {
+pub fn apply_seg(seq: &mut [u8]) {
     apply_seg_opts(seq, SEG_WINDOW, SEG_K1, SEG_K2);
 }
 
 /// Apply SEG masking with custom parameters.
-pub fn apply_seg_opts(seq: &mut Vec<u8>, window: usize, k1: f64, k2: f64) {
+pub fn apply_seg_opts(seq: &mut [u8], window: usize, k1: f64, k2: f64) {
     let mask = seg_mask(seq, window, k1, k2);
     for (i, &m) in mask.iter().enumerate() {
         if m { seq[i] = b'X'; }
@@ -172,7 +172,7 @@ pub fn apply_seg_opts(seq: &mut Vec<u8>, window: usize, k1: f64, k2: f64) {
 }
 
 /// Apply SEG masking to a Ncbistdaa-encoded protein sequence (replaces with code 21 = X).
-pub fn apply_seg_ncbistdaa(seq: &mut Vec<u8>) {
+pub fn apply_seg_ncbistdaa(seq: &mut [u8]) {
     // Decode to ASCII, mask, then find which positions were masked
     let ascii: Vec<u8> = seq.iter().map(|&c| {
         crate::db::sequence::decode_protein(&[c]).into_iter().next().unwrap_or(b'X')
@@ -243,8 +243,8 @@ pub fn repeat_mask(seq: &[u8], nmer_size: usize, threshold: f64) -> Vec<bool> {
         if valid {
             if let Some(&count) = counts.get(&code) {
                 if count >= cutoff {
-                    for j in i..i + nmer_size {
-                        masked[j] = true;
+                    for item in masked.iter_mut().skip(i).take(nmer_size) {
+                        *item = true;
                     }
                 }
             }
@@ -254,12 +254,12 @@ pub fn repeat_mask(seq: &[u8], nmer_size: usize, threshold: f64) -> Vec<bool> {
 }
 
 /// Apply repeat masking in-place, replacing masked positions with `b'N'`.
-pub fn apply_repeat_mask(seq: &mut Vec<u8>) {
+pub fn apply_repeat_mask(seq: &mut [u8]) {
     apply_repeat_mask_opts(seq, REPEAT_NMER, REPEAT_THRESHOLD);
 }
 
 /// Apply repeat masking with custom parameters.
-pub fn apply_repeat_mask_opts(seq: &mut Vec<u8>, nmer_size: usize, threshold: f64) {
+pub fn apply_repeat_mask_opts(seq: &mut [u8], nmer_size: usize, threshold: f64) {
     let mask = repeat_mask(seq, nmer_size, threshold);
     for (i, &m) in mask.iter().enumerate() {
         if m { seq[i] = b'N'; }
@@ -275,7 +275,7 @@ pub fn lowercase_mask(seq: &[u8]) -> Vec<bool> {
 }
 
 /// Apply lowercase masking: replace lowercase positions with X (protein) or N (nucleotide).
-pub fn apply_lowercase_mask_protein(seq: &mut Vec<u8>) {
+pub fn apply_lowercase_mask_protein(seq: &mut [u8]) {
     for b in seq.iter_mut() {
         if b.is_ascii_lowercase() {
             *b = b'X';
@@ -283,7 +283,7 @@ pub fn apply_lowercase_mask_protein(seq: &mut Vec<u8>) {
     }
 }
 
-pub fn apply_lowercase_mask_nucleotide(seq: &mut Vec<u8>) {
+pub fn apply_lowercase_mask_nucleotide(seq: &mut [u8]) {
     for b in seq.iter_mut() {
         if b.is_ascii_lowercase() {
             *b = b'N';

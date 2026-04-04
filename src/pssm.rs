@@ -42,8 +42,8 @@ impl Pssm {
     pub fn from_query(query: &[u8], matrix: &ScoringMatrix, lambda: f64) -> Self {
         let scores: Vec<[i32; 28]> = query.iter().map(|&qa| {
             let mut row = [0i32; 28];
-            for j in 0..28usize {
-                row[j] = matrix.score(qa, j as u8);
+            for (j, cell) in row.iter_mut().enumerate() {
+                *cell = matrix.score(qa, j as u8);
             }
             row
         }).collect();
@@ -104,7 +104,7 @@ pub fn build_pssm(
                 if *sa != b'-' {
                     // Subject residue at this query position
                     let ncbi = ascii_to_ncbistdaa(*sa);
-                    if ncbi >= 1 && ncbi <= 22 {
+                    if (1..=22).contains(&ncbi) {
                         freq_counts[q_pos][ncbi as usize] += 1.0;
                         obs_total[q_pos] += 1.0;
                     }
@@ -213,6 +213,7 @@ pub fn search_with_pssm(
     results
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_one_pssm(
     query: &[u8],
     subject: &[u8],
@@ -305,8 +306,8 @@ fn pssm_to_scoring_matrix(pssm: &Pssm, query: &[u8]) -> ScoringMatrix {
         let qa = qa as usize;
         if qa < 28 {
             cnts[qa] += 1;
-            for j in 0..28usize {
-                sums[qa][j] += pssm.scores[i][j] as i64;
+            for (j, val) in sums[qa].iter_mut().enumerate() {
+                *val += pssm.scores[i][j] as i64;
             }
         }
     }
@@ -335,7 +336,7 @@ pub fn psiblast_search(
 ) -> (Vec<SearchResult>, Pssm) {
     use crate::search::blast_search;
 
-    let mat = ScoringMatrix::from_type(params.matrix);
+    let _mat = ScoringMatrix::from_type(params.matrix);
     let gap = GapPenalty::new(params.gap_open, params.gap_extend);
     let lambda = lookup_ka_params(params.matrix, gap)
         .map(|ka| ka.lambda)
@@ -402,7 +403,6 @@ impl Pssm {
 
     /// Write binary PSSM checkpoint (simple format: query_len, lambda, then scores).
     pub fn write_checkpoint<W: std::io::Write>(&self, out: &mut W) -> std::io::Result<()> {
-        use std::io::Write;
         let len_bytes = (self.query_len as u32).to_le_bytes();
         out.write_all(&len_bytes)?;
         let lambda_bytes = self.lambda.to_le_bytes();
@@ -417,7 +417,6 @@ impl Pssm {
 
     /// Read binary PSSM checkpoint.
     pub fn read_checkpoint<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        use std::io::Read;
         let mut buf4 = [0u8; 4];
         let mut buf8 = [0u8; 8];
 
@@ -430,9 +429,9 @@ impl Pssm {
         let mut scores = Vec::with_capacity(query_len);
         for _ in 0..query_len {
             let mut row = [0i32; 28];
-            for j in 0..28 {
+            for cell in &mut row {
                 reader.read_exact(&mut buf4)?;
-                row[j] = i32::from_le_bytes(buf4);
+                *cell = i32::from_le_bytes(buf4);
             }
             scores.push(row);
         }

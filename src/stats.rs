@@ -62,6 +62,7 @@ impl GapPenalty {
 }
 
 /// Look up pre-computed KA parameters for a protein matrix + gap penalty.
+#[allow(clippy::approx_constant)]
 pub fn lookup_ka_params(matrix: MatrixType, gap: GapPenalty) -> Option<KarlinAltschul> {
     // Values from NCBI blast_stat.c and BLAST documentation.
     // Rows: (gap_open, gap_extend, lambda, K, H, alpha, beta)
@@ -213,6 +214,7 @@ fn find_ka(
 
 /// KA parameters for nucleotide BLAST.
 /// Pre-computed values for common match/mismatch + gap penalty combinations.
+#[allow(clippy::approx_constant)]
 pub fn blastn_ka_params(match_score: i32, mismatch: i32, gap_open: i32, gap_extend: i32) -> KarlinAltschul {
     // Values from NCBI blast_stat.c for nucleotide scoring systems.
     let table: &[(i32, i32, i32, i32, f64, f64, f64)] = &[
