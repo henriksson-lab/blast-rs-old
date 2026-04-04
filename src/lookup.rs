@@ -4,80 +4,79 @@ use crate::matrix::ScoringMatrix;
 
 /// Protein lookup table using neighboring words.
 ///
-/// Cache-friendly packed layout:
-/// - `presence`: bitfield (2.7 KB for word_size=3) — fits in L1, quick rejection
-/// - `offsets`: compact offset table (86 KB) — fits in L2
-/// - `hits`: flat packed array of all query positions
+/// Uses NCBI-style shift-based indexing (charsize=5 bits per residue) for fast
+/// rolling hash computation via shift+or+mask instead of multiply+modulo.
+/// Table size: 2^(word_size * 5) = 32768 for word_size=3.
 ///
-/// For word_size=3 the naive Vec<Vec<u32>> layout uses 514 KB (doesn't fit in L2),
-/// causing cache misses on every subject word lookup. This packed layout reduces
-/// working set by ~6x.
+/// Cache-friendly packed layout:
+/// - `presence`: bitfield (~4 KB for word_size=3) — fits in L1, quick rejection
+/// - `table`: compact (offset, len) pairs for direct indexing
+/// - `hits`: flat packed array of all query positions
 pub struct ProteinLookup {
     pub word_size: usize,
+    /// Number of bits per residue (5 for Ncbistdaa alphabet of 28)
+    pub charsize: u32,
+    /// Mask for rolling hash: (1 << (word_size * charsize)) - 1
+    pub mask: u32,
     /// Presence bitfield: bit `code` is set if any query word matches word `code`.
     presence: Vec<u64>,
-    /// offsets[code] = start index into `hits` for word `code`.
-    /// offsets[capacity] = total length of `hits` (sentinel). Used during build.
-    #[allow(dead_code)]
-    offsets: Vec<u32>,
     /// Flat packed array of query positions for all words, concatenated.
     hits: Vec<u32>,
-    /// For direct indexing from search loop: table[code] = slice into hits.
-    /// This is a Vec of (start, len) pairs, 8 bytes each = 171 KB for word_size=3.
-    /// Still better than 514 KB for Vec<Vec<u32>>.
-    pub table: Vec<(u32, u32)>, // (offset, length)
+    /// Direct index: table[code] = (offset_into_hits, count)
+    pub table: Vec<(u32, u32)>,
     capacity: usize,
 }
 
-/// Encode a protein word of length `word_size` from Ncbistdaa residues.
-/// Uses base-28 encoding.
+/// Encode a protein word using shift-based encoding (NCBI style).
+/// charsize bits per residue, matching ComputeTableIndex.
 #[inline]
 pub fn encode_protein_word(residues: &[u8]) -> u32 {
     let mut code = 0u32;
     for &r in residues {
-        code = code * 28 + (r as u32 % 28);
+        code = (code << 5) | (r as u32 & 0x1F);
     }
     code
 }
 
 impl ProteinLookup {
     /// Build lookup table from query (Ncbistdaa encoded).
-    /// Includes neighboring words scoring >= threshold.
+    /// Uses charsize=5 bit encoding for shift-based rolling hash.
     pub fn build(query: &[u8], word_size: usize, matrix: &ScoringMatrix, threshold: i32) -> Self {
-        let capacity = 28usize.pow(word_size as u32);
+        let charsize = 5u32; // ilog2(28) + 1 = 5, matching NCBI
+        let capacity = 1usize << (word_size as u32 * charsize);
+        let mask = (capacity - 1) as u32;
         let qlen = query.len();
 
         if qlen < word_size {
             return ProteinLookup {
-                word_size,
+                word_size, charsize, mask,
                 presence: vec![0u64; capacity.div_ceil(64)],
-                offsets: vec![0u32; capacity + 1],
                 hits: Vec::new(),
                 table: vec![(0, 0); capacity],
                 capacity,
             };
         }
 
-        // Phase 1: collect hits into temporary Vec<Vec<u32>> (build phase only)
+        // Phase 1: collect hits using temporary Vec per code
         let mut tmp = vec![Vec::new(); capacity];
         for q_pos in 0..=(qlen - word_size) {
             let query_word = &query[q_pos..q_pos + word_size];
-            enumerate_neighbors(query_word, word_size, matrix, threshold, &mut |neighbor_code| {
-                tmp[neighbor_code as usize].push(q_pos as u32);
+            // Enumerate neighbors but encode with shift-based scheme
+            enumerate_neighbors_shift(query_word, word_size, charsize, matrix, threshold, &mut |code| {
+                tmp[code as usize].push(q_pos as u32);
             });
         }
 
         // Phase 2: pack into flat arrays
         let mut presence = vec![0u64; capacity.div_ceil(64)];
-        let mut offsets = vec![0u32; capacity + 1];
         let mut total = 0u32;
+        let mut offsets = vec![0u32; capacity + 1];
         for code in 0..capacity {
             offsets[code] = total;
-            let len = tmp[code].len() as u32;
-            if len > 0 {
+            if !tmp[code].is_empty() {
                 presence[code / 64] |= 1u64 << (code % 64);
             }
-            total += len;
+            total += tmp[code].len() as u32;
         }
         offsets[capacity] = total;
 
@@ -89,16 +88,11 @@ impl ProteinLookup {
             }
         }
 
-        // Build table for direct indexing
         let table: Vec<(u32, u32)> = (0..capacity)
-            .map(|code| {
-                let start = offsets[code];
-                let len = offsets[code + 1] - start;
-                (start, len)
-            })
+            .map(|code| (offsets[code], offsets[code + 1] - offsets[code]))
             .collect();
 
-        ProteinLookup { word_size, presence, offsets, hits, table, capacity }
+        ProteinLookup { word_size, charsize, mask, presence, hits, table, capacity }
     }
 
     /// Get the hit slice for a word code. Returns empty slice if no hits.
@@ -106,21 +100,19 @@ impl ProteinLookup {
     pub fn get_hits(&self, code: u32) -> &[u32] {
         let code = code as usize;
         if code < self.capacity {
-            // Quick presence check (L1 cache — 2.7 KB bitfield)
             let word = code / 64;
             let bit = code % 64;
-            if self.presence[word] & (1u64 << bit) == 0 {
+            if unsafe { *self.presence.get_unchecked(word) } & (1u64 << bit) == 0 {
                 return &[];
             }
-            let (start, len) = self.table[code];
-            &self.hits[start as usize..(start + len) as usize]
+            let (start, len) = unsafe { *self.table.get_unchecked(code) };
+            unsafe { self.hits.get_unchecked(start as usize..(start + len) as usize) }
         } else {
             &[]
         }
     }
 
     /// Look up query positions for a subject word (Ncbistdaa encoded).
-    /// Kept for backward compatibility with tblastn/tblastx/psiblast.
     #[inline]
     pub fn lookup(&self, subject_word: &[u8]) -> Option<&[u32]> {
         let code = encode_protein_word(subject_word) as usize;
@@ -137,24 +129,21 @@ impl ProteinLookup {
     }
 }
 
-/// Enumerate all words of length `word_size` that score >= threshold against the query word.
-fn enumerate_neighbors(
+/// Enumerate neighbors using shift-based (charsize=5) encoding.
+fn enumerate_neighbors_shift(
     query_word: &[u8],
     word_size: usize,
+    charsize: u32,
     matrix: &ScoringMatrix,
     threshold: i32,
     callback: &mut impl FnMut(u32),
 ) {
-    // Precompute suffix max scores: max_suffix[i] = max possible score from positions i..word_size
-    // This avoids recomputing at every recursive call.
     let mut max_suffix = vec![0i32; word_size + 1];
     for i in (0..word_size).rev() {
         let q = query_word[i];
         let best = (0u8..28).map(|r| matrix.score(q, r)).max().unwrap_or(0);
         max_suffix[i] = max_suffix[i + 1] + best;
     }
-
-    // Precompute score rows: for each query position, the score for each possible residue
     let mut score_rows = vec![[0i32; 28]; word_size];
     for (i, row) in score_rows.iter_mut().enumerate() {
         let q = query_word[i];
@@ -162,15 +151,16 @@ fn enumerate_neighbors(
             row[r as usize] = matrix.score(q, r);
         }
     }
-
-    enumerate_rec(&score_rows, &max_suffix, word_size, threshold, 0, 0, 0, callback);
+    enumerate_rec_shift(&score_rows, &max_suffix, word_size, charsize, threshold, 0, 0, 0, callback);
 }
 
+/// Recursive neighbor enumeration with shift-based encoding.
 #[allow(clippy::too_many_arguments)]
-fn enumerate_rec(
+fn enumerate_rec_shift(
     score_rows: &[[i32; 28]],
     max_suffix: &[i32],
     word_size: usize,
+    charsize: u32,
     threshold: i32,
     pos: usize,
     current_score: i32,
@@ -183,31 +173,14 @@ fn enumerate_rec(
         }
         return;
     }
-
-    // Prune: even with best possible remaining scores, can't reach threshold
-    if current_score + max_suffix[pos] < threshold {
-        return;
-    }
-
+    if current_score + max_suffix[pos] < threshold { return; }
     let scores = &score_rows[pos];
     for r in 0u8..28 {
-        let s = scores[r as usize];
-        let new_score = current_score + s;
-        // Per-residue pruning: check if this choice can still reach threshold
-        if new_score + max_suffix[pos + 1] < threshold {
-            continue;
-        }
-        let new_code = current_code * 28 + r as u32;
-        enumerate_rec(
-            score_rows,
-            max_suffix,
-            word_size,
-            threshold,
-            pos + 1,
-            new_score,
-            new_code,
-            callback,
-        );
+        let new_score = current_score + scores[r as usize];
+        if new_score + max_suffix[pos + 1] < threshold { continue; }
+        // Shift-based encoding: (code << charsize) | residue
+        let new_code = (current_code << charsize) | r as u32;
+        enumerate_rec_shift(score_rows, max_suffix, word_size, charsize, threshold, pos + 1, new_score, new_code, callback);
     }
 }
 

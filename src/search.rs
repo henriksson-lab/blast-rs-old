@@ -410,28 +410,33 @@ fn search_one_protein_scratch(
     let ws = lookup.word_size;
     if slen < ws { return vec![]; }
 
-    let modulus = 28u32.pow(ws as u32 - 1);
     let num_words = slen - ws + 1;
     let cutoff = params.ungapped_cutoff.max(1);
     let x_drop = params.x_drop_ungapped;
     let diag_mask = scratch.diag_mask;
     let diag_offset = scratch.diag_offset;
     let window = params.two_hit_window as i32;
+    // NCBI-style shift-based rolling hash: (code << charsize | residue) & mask
+    let charsize = lookup.charsize;
+    let mask = lookup.mask;
 
     scratch.ungapped_hits.clear();
 
-    // Phase 1: Batch scan — collect all (q_off, s_off) pairs
+    // Phase 1: Batch scan with shift-based rolling hash (NCBI ComputeTableIndexIncremental)
     scratch.offset_pairs.clear();
     {
+        // Prime the index (NCBI: ComputeTableIndex)
         let mut code = 0u32;
         for &r in subject.iter().take(ws) {
-            code = code * 28 + (r as u32 % 28);
+            code = (code << charsize) | (r as u32 & 0x1F);
         }
-        for &q_pos in lookup.get_hits(code) {
+        let hits = lookup.get_hits(code);
+        for &q_pos in hits {
             scratch.offset_pairs.push((q_pos, 0));
         }
+        // Incremental index (NCBI: ComputeTableIndexIncremental)
         for s_pos in 1..num_words {
-            code = (code % modulus) * 28 + (subject[s_pos + ws - 1] as u32 % 28);
+            code = ((code << charsize) | (subject[s_pos + ws - 1] as u32 & 0x1F)) & mask;
             let hits = lookup.get_hits(code);
             if hits.is_empty() { continue; }
             let s = s_pos as u32;
@@ -584,7 +589,7 @@ fn ungapped_extend_inline(
     while qi > 0 && si > 0 {
         qi -= 1;
         si -= 1;
-        score += score_profile[qi][subject[si] as usize % 28];
+        score += score_profile[qi][subject[si] as usize];
         if score > best {
             best = score;
             best_q_start = qi;
@@ -603,7 +608,7 @@ fn ungapped_extend_inline(
     let mut best_q_end = q_pos;
     let mut best_s_end = s_pos;
     while qi < qlen && si < slen {
-        score += score_profile[qi][subject[si] as usize % 28];
+        score += score_profile[qi][subject[si] as usize];
         if score > best {
             best = score;
             best_q_end = qi + 1;
@@ -616,7 +621,7 @@ fn ungapped_extend_inline(
     }
 
     let center = if q_pos < qlen && s_pos < slen {
-        score_profile[q_pos][subject[s_pos] as usize % 28]
+        score_profile[q_pos][subject[s_pos] as usize]
     } else { 0 };
 
     (left_score + center + best, best_q_start, best_q_end, best_s_start, best_s_end)
@@ -641,7 +646,7 @@ fn search_one_protein_fast(
     if slen < ws { return vec![]; }
 
     // Rolling word codes for subject
-    let modulus = 28u32.pow(ws as u32 - 1);
+    let mask = lookup.mask;
     let num_words = slen - ws + 1;
 
     // Quick scan: count total hits before doing extensions.
@@ -649,11 +654,11 @@ fn search_one_protein_fast(
     let mut total_hits = 0u32;
     let mut code = 0u32;
     for &r in subject.iter().take(ws) {
-        code = code * 28 + (r as u32 % 28);
+        code = (code << 5) | (r as u32 & 0x1F);
     }
     if !lookup.get_hits(code).is_empty() { total_hits += 1; }
     for &r in subject.iter().skip(ws) {
-        code = (code % modulus) * 28 + (r as u32 % 28);
+        code = ((code << 5) | (r as u32 & 0x1F)) & mask;
         if !lookup.get_hits(code).is_empty() { total_hits += 1; }
     }
     if total_hits == 0 { return vec![]; }
@@ -675,7 +680,7 @@ fn search_one_protein_fast(
         while qi > 0 && si > 0 {
             qi -= 1;
             si -= 1;
-            score += score_profile[qi][subject[si] as usize % 28];
+            score += score_profile[qi][subject[si] as usize];
             if score > best {
                 best = score;
                 best_q_start = qi;
@@ -694,7 +699,7 @@ fn search_one_protein_fast(
         let mut best_q_end = q_pos;
         let mut best_s_end = s_pos;
         while qi < query.len() && si < slen {
-            score += score_profile[qi][subject[si] as usize % 28];
+            score += score_profile[qi][subject[si] as usize];
             if score > best {
                 best = score;
                 best_q_end = qi + 1;
@@ -707,7 +712,7 @@ fn search_one_protein_fast(
         }
 
         let center = if q_pos < query.len() && s_pos < slen {
-            score_profile[q_pos][subject[s_pos] as usize % 28]
+            score_profile[q_pos][subject[s_pos] as usize]
         } else { 0 };
 
         (left_score + center + best, best_q_start, best_q_end, best_s_start, best_s_end)
@@ -721,7 +726,7 @@ fn search_one_protein_fast(
 
         let mut code = 0u32;
         for &r in subject.iter().take(ws) {
-            code = code * 28 + (r as u32 % 28);
+            code = (code << 5) | (r as u32 & 0x1F);
         }
         // Process first word
         for &q_pos in lookup.get_hits(code) {
@@ -731,7 +736,7 @@ fn search_one_protein_fast(
         }
         // Process remaining words with rolling code
         for s_pos in 1..num_words {
-            code = (code % modulus) * 28 + (subject[s_pos + ws - 1] as u32 % 28);
+            code = ((code << 5) | (subject[s_pos + ws - 1] as u32 & 0x1F)) & mask;
             let positions = lookup.get_hits(code);
             if positions.is_empty() { continue; }
             for &q_pos in positions {
@@ -763,7 +768,7 @@ fn search_one_protein_fast(
 
         let mut code = 0u32;
         for &r in subject.iter().take(ws) {
-            code = code * 28 + (r as u32 % 28);
+            code = (code << 5) | (r as u32 & 0x1F);
         }
         // Inline the scan + extend loop with rolling codes
         {
@@ -780,7 +785,7 @@ fn search_one_protein_fast(
             }
         }
         for s_pos in 1..num_words {
-            code = (code % modulus) * 28 + (subject[s_pos + ws - 1] as u32 % 28);
+            code = ((code << 5) | (subject[s_pos + ws - 1] as u32 & 0x1F)) & mask;
             let positions = lookup.get_hits(code);
             if positions.is_empty() { continue; }
             for &q_pos in positions {
@@ -882,16 +887,16 @@ fn search_one_protein(
     if slen < ws { return vec![]; }
 
     // Precompute rolling word codes for the subject to avoid per-position re-encoding
-    let modulus = 28u32.pow(ws as u32 - 1);
+    let mask = lookup.mask;
     let mut subject_codes: Vec<u32> = Vec::with_capacity(slen - ws + 1);
     {
         let mut code = 0u32;
         for &r in subject.iter().take(ws) {
-            code = code * 28 + (r as u32 % 28);
+            code = (code << 5) | (r as u32 & 0x1F);
         }
         subject_codes.push(code);
         for &r in subject.iter().skip(ws) {
-            code = (code % modulus) * 28 + (r as u32 % 28);
+            code = ((code << 5) | (r as u32 & 0x1F)) & mask;
             subject_codes.push(code);
         }
     }
