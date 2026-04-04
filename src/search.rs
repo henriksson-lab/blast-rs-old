@@ -4,7 +4,7 @@ use std::io::BufRead;
 use rayon::prelude::*;
 use crate::db::BlastDb;
 
-use crate::matrix::{ScoringMatrix, MatrixType};
+use crate::matrix::{ScoringMatrix, MatrixType, nt_to_2bit};
 use crate::stats::{KarlinAltschul, GapPenalty, lookup_ka_params, blastn_ka_params};
 use crate::lookup::{ProteinLookup, NucleotideLookup, DiscontiguousLookup};
 use crate::extend::{ungapped_extend, gapped_extend, ungapped_extend_nucleotide};
@@ -623,7 +623,10 @@ fn search_one_nucleotide(
     ungapped_hits.sort_by(|a, b| b.score.cmp(&a.score));
 
     // Gapped extension with nucleotide scoring
+    // Convert query/subject to 2-bit encoding for the scoring matrix (indices 0-3)
     let nt_matrix = build_nt_matrix(params.match_score, params.mismatch);
+    let query_2bit: Vec<u8> = query.iter().map(|&b| nt_to_2bit(b)).collect();
+    let subject_2bit: Vec<u8> = subject.iter().map(|&b| nt_to_2bit(b)).collect();
     let mut hsps = Vec::new();
     let mut covered: Vec<bool> = vec![false; query.len()];
 
@@ -633,7 +636,7 @@ fn search_one_nucleotide(
         let center_s = (uh.s_start + uh.s_end) / 2;
 
         let gh = gapped_extend(
-            query, subject,
+            &query_2bit, &subject_2bit,
             center_q, center_s,
             &nt_matrix,
             params.gap_open, params.gap_extend,
@@ -650,19 +653,32 @@ fn search_one_nucleotide(
             covered[i] = true;
         }
 
+        // Convert 2-bit alignment bytes back to ASCII nucleotides
+        let query_aln = gh.query_aln.iter().map(|&b| bit2_to_ascii(b)).collect();
+        let subject_aln = gh.subject_aln.iter().map(|&b| bit2_to_ascii(b)).collect();
+
         hsps.push(Hsp {
             score: gh.score, bit_score, evalue,
             query_start: gh.q_start, query_end: gh.q_end,
             subject_start: gh.s_start, subject_end: gh.s_end,
             num_identities: gh.num_identities, num_gaps: gh.num_gaps,
             alignment_length: gh.query_aln.len(),
-            query_aln: gh.query_aln, midline: gh.midline, subject_aln: gh.subject_aln,
+            query_aln, midline: gh.midline, subject_aln,
             query_frame: 0, subject_frame: 0,
         });
     }
 
     hsps.sort_by(|a, b| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal));
     hsps
+}
+
+/// Convert a 2-bit encoded nucleotide (0-3) back to ASCII, preserving gap characters.
+fn bit2_to_ascii(b: u8) -> u8 {
+    match b {
+        0 => b'A', 1 => b'C', 2 => b'G', 3 => b'T',
+        b'-' => b'-',
+        _ => b'N',
+    }
 }
 
 /// Build a simple nucleotide scoring matrix (28×28, Ncbistdaa-compatible indices unused;
