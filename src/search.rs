@@ -238,18 +238,17 @@ pub fn blast_search(
     let threshold = adjusted_threshold(base_threshold, query_for_lookup.len());
     let lookup = ProteinLookup::build(query_for_lookup, params.word_size, &matrix, threshold);
 
-    // Compute NCBI-style gap_trigger cutoff: minimum ungapped score to attempt gapped extension.
-    // gap_trigger_bits = 22.0 (NCBI default), converted to raw score: (bits * ln2 + logK) / lambda.
-    // This filters out low-scoring ungapped hits that would waste time in gapped extension.
+    // NCBI-style two-threshold approach:
+    // 1. ungapped_cutoff: minimum ungapped score to keep a hit (low — keeps weak hits)
+    // 2. gap_trigger: minimum ungapped score to attempt gapped extension (higher — saves time)
+    // Hits below gap_trigger are kept but not gapped-extended; they may still appear in output
+    // if they pass the evalue threshold based on ungapped score alone.
     let gap_trigger_bits = 22.0f64;
     let gap_trigger_score = ((gap_trigger_bits * std::f64::consts::LN_2 + ka.k.ln()) / ka.lambda) as i32;
-    // Cap at half the maximum possible ungapped score for the query length,
-    // so short queries (e.g. translated 8aa frames) aren't filtered too aggressively.
-    let max_possible = (query_for_extend.len() as i32) * 4; // ~4 per residue avg for BLOSUM62 self-match
     let effective_cutoff = if params.ungapped_cutoff > 0 {
         params.ungapped_cutoff
     } else {
-        gap_trigger_score.max(1).min(max_possible / 2)
+        1 // Keep all ungapped hits with score > 0
     };
 
     let query_comp = if params.comp_adjust { Some(composition_ncbistdaa(query_for_extend)) } else { None };
@@ -288,7 +287,7 @@ pub fn blast_search(
             search_one_protein_scratch(
                 query_for_extend, subject, &lookup, &matrix, &ka, params,
                 eff_query_len, eff_db_len, &score_profile, &mut scratch,
-                effective_cutoff,
+                effective_cutoff, gap_trigger_score,
             )
         });
 
@@ -421,6 +420,7 @@ fn search_one_protein_scratch(
     score_profile: &[[i32; 28]],
     scratch: &mut SearchScratch,
     ungapped_cutoff: i32,
+    gap_trigger: i32,
 ) -> Vec<Hsp> {
     let slen = subject.len();
     let ws = lookup.word_size;
@@ -530,10 +530,22 @@ fn search_one_protein_scratch(
     scratch.reset_covered(query.len());
     let mut hsps = Vec::new();
 
-    for &(_, qs, qe, ss, se) in &scratch.ungapped_hits {
+    for &(score, qs, qe, ss, se) in &scratch.ungapped_hits {
         let center_q = (qs + qe) / 2;
         if center_q < query.len() && scratch.covered_query[center_q] { continue; }
         let center_s = (ss + se) / 2;
+
+        // Only attempt gapped extension if ungapped score meets the gap trigger threshold.
+        // Lower-scoring hits are still kept as ungapped HSPs if they pass the evalue threshold.
+        if score < gap_trigger {
+            // Below gap trigger: skip gapped extension only if the ungapped
+            // evalue already exceeds the threshold. Otherwise, do gapped
+            // extension anyway to produce a proper alignment.
+            let ug_evalue = ka.evalue(score, eff_query_len, eff_db_len);
+            if ug_evalue > params.evalue_threshold { continue; }
+            // Falls through to gapped extension below — this hit has a good
+            // enough ungapped score to potentially produce a significant gapped alignment.
+        }
 
         let prelim_score = gapped_extend_score_only(
             query, subject, center_q, center_s, matrix,
