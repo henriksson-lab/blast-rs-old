@@ -7,9 +7,11 @@ pub mod builder;
 pub mod lmdb_v5;
 pub mod oid_seqids;
 pub mod oid_taxids;
+pub mod taxonomy;
 mod tests;
 
 pub use blastdb::BlastDb;
+pub use taxonomy::TaxDb;
 pub use header::BlastDefLine;
 pub use error::DbError;
 pub use builder::{BlastDbBuilder, SequenceEntry};

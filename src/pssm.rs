@@ -199,12 +199,14 @@ pub fn search_with_pssm(
         if hsps.is_empty() { return None; }
 
         let header = db.get_header(oid).unwrap_or_default();
+        let taxids = db.get_taxids(oid).and_then(|r| r.ok()).unwrap_or_default();
         Some(SearchResult {
             subject_oid: oid,
             subject_title: header.title,
             subject_accession: header.accession,
             subject_len: subject.len(),
             hsps,
+            taxids,
         })
     }).collect();
 

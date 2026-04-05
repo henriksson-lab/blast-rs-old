@@ -69,7 +69,7 @@ fn blastp_exact_match() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = blastp(&db, seq.as_bytes(), &params);
 
@@ -91,7 +91,7 @@ fn blastp_no_hit_for_unrelated() {
         .evalue(1e-10)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = blastp(&db, b"WWWWWWWWWWWWWWWWWWWWWWWWWWWW", &params);
     assert!(results.is_empty(), "unrelated sequences should not produce hits at strict evalue");
@@ -111,7 +111,7 @@ fn blastp_finds_similar_sequence() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = blastp(&db, query.as_bytes(), &params);
     assert!(results.len() >= 2, "should find both similar sequences");
@@ -133,7 +133,7 @@ fn blastp_max_target_seqs_limits_results() {
         .max_target_seqs(3)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = blastp(&db, query.as_bytes(), &params);
     assert!(results.len() <= 3, "max_target_seqs=3 should limit results to at most 3, got {}", results.len());
@@ -150,13 +150,13 @@ fn blastp_evalue_filter() {
         .evalue(1e-100)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
     // Loose threshold
     let loose = SearchParams::blastp()
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let strict_results = blastp(&db, query.as_bytes(), &strict);
     let loose_results = blastp(&db, query.as_bytes(), &loose);
@@ -174,7 +174,7 @@ fn blastp_hsp_coordinates() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = blastp(&db, query.as_bytes(), &params);
     assert!(!results.is_empty());
@@ -204,7 +204,7 @@ fn blastp_multiple_hsps() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = blastp(&db, query.as_bytes(), &params);
     // Should find the hit; may produce 1 or 2 HSPs depending on algorithm
@@ -299,7 +299,7 @@ fn blastx_finds_translated_hit() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = blastx(&db, nt_query.as_bytes(), &params);
     assert!(!results.is_empty(), "blastx should find the translated protein");
@@ -324,7 +324,7 @@ fn tblastn_finds_protein_in_nt_db() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = tblastn(&db, protein_query.as_bytes(), &params);
     assert!(!results.is_empty(), "tblastn should find protein in translated nucleotide db");
@@ -345,7 +345,7 @@ fn tblastx_translated_vs_translated() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = tblastx(&db, nt_seq.as_bytes(), &params);
     assert!(!results.is_empty(), "tblastx should find self-hit in translated mode");
@@ -369,7 +369,7 @@ fn psiblast_iterates_and_returns_pssm() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
     let psi_params = PsiblastParams::new(search_params).num_iterations(2);
 
     let (results, pssm) = psiblast(&db, query.as_bytes(), &psi_params);
@@ -492,12 +492,12 @@ fn blastp_multithreaded_same_results() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
     let multi = SearchParams::blastp()
         .evalue(10.0)
         .num_threads(4)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let r1 = blastp(&db, query.as_bytes(), &single);
     let r2 = blastp(&db, query.as_bytes(), &multi);
@@ -524,7 +524,7 @@ fn blastp_different_matrices() {
             .matrix(*matrix)
             .num_threads(1)
             .filter_low_complexity(false)
-            .comp_adjust(false);
+            .comp_adjust(0);
 
         let results = blastp(&db, query.as_bytes(), &params);
         assert!(!results.is_empty(),
@@ -586,7 +586,7 @@ fn blastp_short_query_below_word_size() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     // 2-residue query, below word_size=3
     let results = blastp(&db, b"MK", &params);
@@ -603,7 +603,7 @@ fn blastp_single_residue_query() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = blastp(&db, b"M", &params);
     let _ = results; // should not panic
@@ -633,7 +633,7 @@ fn blastp_empty_query() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = blastp(&db, b"", &params);
     assert!(results.is_empty(), "empty query should produce no results");
@@ -664,7 +664,7 @@ fn blastp_query_with_ambiguous_residues() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = blastp(&db, query.as_bytes(), &params);
     // Should still find a hit despite one X
@@ -699,7 +699,7 @@ fn blastp_short_subject_in_db() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = blastp(&db, b"MKFLILLFNILCLFPVLAADNHGVSMNAS", &params);
     let _ = results; // should not panic
@@ -739,7 +739,7 @@ fn blastx_empty_nt_query() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = blastx(&db, b"", &params);
     assert!(results.is_empty());
@@ -754,7 +754,7 @@ fn tblastn_empty_protein_query() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = tblastn(&db, b"", &params);
     assert!(results.is_empty());
@@ -790,7 +790,7 @@ fn blastp_all_twenty_amino_acids() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     let results = blastp(&db, query.as_bytes(), &params);
     assert!(!results.is_empty());
@@ -811,7 +811,7 @@ fn blastp_stop_codon_in_sequence() {
         .evalue(10.0)
         .num_threads(1)
         .filter_low_complexity(false)
-        .comp_adjust(false);
+        .comp_adjust(0);
 
     // Should not panic
     let results = blastp(&db, query.as_bytes(), &params);

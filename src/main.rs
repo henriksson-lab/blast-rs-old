@@ -43,6 +43,8 @@ enum Commands {
     Blastdbcmd(BlastdbcmdArgs),
     /// Create a BLAST database alias
     BlastdbAliastool(AliasArgs),
+    /// Re-format BLAST archive (format 11) output into other formats
+    BlastFormatter(FormatterArgs),
 }
 
 #[derive(clap::Args)]
@@ -91,6 +93,11 @@ struct BlastArgs {
     #[arg(long = "no-lc-filter")]
     no_lc_filter: bool,
     /// Disable composition-based statistics adjustment
+    /// Composition-based statistics mode: 0=off, 1=unconditional (default), 2=conditional, 3=forced
+    #[arg(long = "comp-based-stats", default_value = "1")]
+    comp_based_stats: u8,
+
+    /// Disable composition-based statistics (alias for --comp-based-stats 0)
     #[arg(long = "no-comp-adjust")]
     no_comp_adjust: bool,
     /// Query strand: both, plus, minus (nucleotide searches only)
@@ -307,6 +314,19 @@ struct AliasArgs {
     title: Option<String>,
 }
 
+#[derive(clap::Args)]
+struct FormatterArgs {
+    /// Input BLAST archive file (format 11 output)
+    #[arg(long = "archive", short = 'a')]
+    archive: PathBuf,
+    /// Output format (same as --outfmt in search commands)
+    #[arg(long = "outfmt", default_value = "0")]
+    outfmt: String,
+    /// Output file (default: stdout)
+    #[arg(short, long)]
+    out: Option<PathBuf>,
+}
+
 fn main() {
     let cli = Cli::parse();
     match &cli.command {
@@ -320,6 +340,7 @@ fn main() {
         Commands::Makeblastdb(args) => run_makeblastdb(args),
         Commands::Blastdbcmd(args)  => run_blastdbcmd(args),
         Commands::BlastdbAliastool(args) => run_aliastool(args),
+        Commands::BlastFormatter(args) => run_blast_formatter(args),
     }
 }
 
@@ -343,7 +364,7 @@ fn apply_task_preset(params: &mut SearchParams, task: &str, program: &str) {
         ("blastp", "blastp-short") => {
             params.word_size = 2;
             params.evalue_threshold = 20000.0;
-            params.comp_adjust = false;
+            params.comp_adjust = 0;
         }
         ("blastp", "blastp-fast") => {
             params.word_size = 6;
@@ -537,7 +558,7 @@ fn run_blastp(args: &BlastArgs) {
     params.evalue_threshold = args.evalue;
     params.max_target_seqs = args.max_target_seqs;
     params.filter_low_complexity = !args.no_lc_filter;
-    params.comp_adjust = !args.no_comp_adjust;
+    params.comp_adjust = if args.no_comp_adjust { 0 } else { args.comp_based_stats };
     if let Some(go) = args.gap_open { params.gap_open = go; }
     if let Some(ge) = args.gap_extend { params.gap_extend = ge; }
     if let Some(ws) = args.word_size { params.word_size = ws; }
@@ -572,7 +593,7 @@ fn run_blastp(args: &BlastArgs) {
 
     if fmt.fmt_id == 5 {
         output::write_xml_header(&mut out, "blastp", &db_path, "blast-cli 0.1.0").unwrap();
-    } else if fmt.fmt_id == 15 {
+    } else if fmt.fmt_id == 13 || fmt.fmt_id == 15 {
         output::write_json_header(&mut out).unwrap();
     }
 
@@ -591,7 +612,7 @@ fn run_blastp(args: &BlastArgs) {
         }
 
         // JSON comma separator between multi-query entries
-        if fmt.fmt_id == 15 && iter_num > 0 {
+        if (fmt.fmt_id == 13 || fmt.fmt_id == 15) && iter_num > 0 {
             writeln!(out, ",").unwrap();
         }
 
@@ -610,7 +631,7 @@ fn run_blastp(args: &BlastArgs) {
             evalue_threshold: args.evalue,
             iter_num: iter_num + 1,
             num_descriptions: None,
-            num_alignments: None,
+            num_alignments: None, taxdb: None,
         };
 
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
@@ -622,7 +643,7 @@ fn run_blastp(args: &BlastArgs) {
 
     if fmt.fmt_id == 5 {
         output::write_xml_footer(&mut out).unwrap();
-    } else if fmt.fmt_id == 15 {
+    } else if fmt.fmt_id == 13 || fmt.fmt_id == 15 {
         output::write_json_footer(&mut out).unwrap();
     }
 }
@@ -666,7 +687,7 @@ fn run_blastn(args: &BlastArgs) {
     params.match_score = args.match_score;
     params.mismatch = args.mismatch;
     params.filter_low_complexity = !args.no_lc_filter;
-    params.comp_adjust = !args.no_comp_adjust;
+    params.comp_adjust = if args.no_comp_adjust { 0 } else { args.comp_based_stats };
     if let Some(go) = args.gap_open { params.gap_open = go; }
     if let Some(ge) = args.gap_extend { params.gap_extend = ge; }
     if let Some(ws) = args.word_size { params.word_size = ws; }
@@ -702,7 +723,7 @@ fn run_blastn(args: &BlastArgs) {
 
     if fmt.fmt_id == 5 {
         output::write_xml_header(&mut out, "blastn", &db_path, "blast-cli 0.1.0").unwrap();
-    } else if fmt.fmt_id == 15 {
+    } else if fmt.fmt_id == 13 || fmt.fmt_id == 15 {
         output::write_json_header(&mut out).unwrap();
     }
 
@@ -715,7 +736,7 @@ fn run_blastn(args: &BlastArgs) {
     let filter = build_oid_filter(&db, args);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        if fmt.fmt_id == 15 && iter_num > 0 { writeln!(out, ",").unwrap(); }
+        if (fmt.fmt_id == 13 || fmt.fmt_id == 15) && iter_num > 0 { writeln!(out, ",").unwrap(); }
         let mut results = if use_dc {
             let tt = args.template_type.unwrap_or(0);
             let tl = args.template_length.unwrap_or(21);
@@ -742,7 +763,7 @@ fn run_blastn(args: &BlastArgs) {
             evalue_threshold: args.evalue,
             iter_num: iter_num + 1,
             num_descriptions: None,
-            num_alignments: None,
+            num_alignments: None, taxdb: None,
         };
 
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
@@ -754,7 +775,7 @@ fn run_blastn(args: &BlastArgs) {
 
     if fmt.fmt_id == 5 {
         output::write_xml_footer(&mut out).unwrap();
-    } else if fmt.fmt_id == 15 {
+    } else if fmt.fmt_id == 13 || fmt.fmt_id == 15 {
         output::write_json_footer(&mut out).unwrap();
     }
 
@@ -816,7 +837,7 @@ fn run_blastx(args: &BlastArgs) {
     params.evalue_threshold = args.evalue;
     params.max_target_seqs = args.max_target_seqs;
     params.filter_low_complexity = !args.no_lc_filter;
-    params.comp_adjust = !args.no_comp_adjust;
+    params.comp_adjust = if args.no_comp_adjust { 0 } else { args.comp_based_stats };
     if let Some(go) = args.gap_open  { params.gap_open = go; }
     if let Some(ge) = args.gap_extend { params.gap_extend = ge; }
     if let Some(ws) = args.word_size  { params.word_size = ws; }
@@ -844,7 +865,7 @@ fn run_blastx(args: &BlastArgs) {
     let db_len   = db.volume_length();
 
     if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "blastx", &db_path, "blast-cli 0.1.0").unwrap(); }
-    else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
+    else if fmt.fmt_id == 13 || fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
     if args.html {
         writeln!(out, "<!DOCTYPE html><html><head><title>BLAST Results</title>\
@@ -855,7 +876,7 @@ fn run_blastx(args: &BlastArgs) {
     let filter = build_oid_filter(&db, args);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        if fmt.fmt_id == 15 && iter_num > 0 { writeln!(out, ",").unwrap(); }
+        if (fmt.fmt_id == 13 || fmt.fmt_id == 15) && iter_num > 0 { writeln!(out, ",").unwrap(); }
         let mut results = api_blastx(&db, query_seq, &params);
         if let Some(ref f) = filter {
             results.retain(|r| f.contains(&r.subject_oid));
@@ -866,7 +887,7 @@ fn run_blastx(args: &BlastArgs) {
             query_seq, query_len: query_seq.len(),
             matrix: "N/A", gap_open: params.gap_open, gap_extend: params.gap_extend,
             evalue_threshold: args.evalue, iter_num: iter_num + 1,
-            num_descriptions: None, num_alignments: None,
+            num_descriptions: None, num_alignments: None, taxdb: None,
         };
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
     }
@@ -874,7 +895,7 @@ fn run_blastx(args: &BlastArgs) {
     if args.html { writeln!(out, "</body></html>").unwrap(); }
 
     if fmt.fmt_id == 5 { output::write_xml_footer(&mut out).unwrap(); }
-    else if fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
+    else if fmt.fmt_id == 13 || fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
 }
 
 // ── TBLASTN ──────────────────────────────────────────────────────────────────
@@ -893,7 +914,7 @@ fn run_tblastn(args: &BlastArgs) {
     params.evalue_threshold = args.evalue;
     params.max_target_seqs = args.max_target_seqs;
     params.filter_low_complexity = !args.no_lc_filter;
-    params.comp_adjust = !args.no_comp_adjust;
+    params.comp_adjust = if args.no_comp_adjust { 0 } else { args.comp_based_stats };
     if let Some(go) = args.gap_open   { params.gap_open = go; }
     if let Some(ge) = args.gap_extend { params.gap_extend = ge; }
     if let Some(ws) = args.word_size  { params.word_size = ws; }
@@ -922,7 +943,7 @@ fn run_tblastn(args: &BlastArgs) {
     let matrix_name = args.matrix.as_str();
 
     if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "tblastn", &db_path, "blast-cli 0.1.0").unwrap(); }
-    else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
+    else if fmt.fmt_id == 13 || fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
     if args.html {
         writeln!(out, "<!DOCTYPE html><html><head><title>BLAST Results</title>\
@@ -933,7 +954,7 @@ fn run_tblastn(args: &BlastArgs) {
     let filter = build_oid_filter(&db, args);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        if fmt.fmt_id == 15 && iter_num > 0 { writeln!(out, ",").unwrap(); }
+        if (fmt.fmt_id == 13 || fmt.fmt_id == 15) && iter_num > 0 { writeln!(out, ",").unwrap(); }
         let mut results = api_tblastn(&db, query_seq, &params);
         if let Some(ref f) = filter {
             results.retain(|r| f.contains(&r.subject_oid));
@@ -944,7 +965,7 @@ fn run_tblastn(args: &BlastArgs) {
             query_seq, query_len: query_seq.len(),
             matrix: matrix_name, gap_open: params.gap_open, gap_extend: params.gap_extend,
             evalue_threshold: args.evalue, iter_num: iter_num + 1,
-            num_descriptions: None, num_alignments: None,
+            num_descriptions: None, num_alignments: None, taxdb: None,
         };
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
     }
@@ -952,7 +973,7 @@ fn run_tblastn(args: &BlastArgs) {
     if args.html { writeln!(out, "</body></html>").unwrap(); }
 
     if fmt.fmt_id == 5 { output::write_xml_footer(&mut out).unwrap(); }
-    else if fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
+    else if fmt.fmt_id == 13 || fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
 }
 
 // ── TBLASTX ──────────────────────────────────────────────────────────────────
@@ -969,7 +990,7 @@ fn run_tblastx(args: &BlastArgs) {
     params.evalue_threshold = args.evalue;
     params.max_target_seqs = args.max_target_seqs;
     params.filter_low_complexity = !args.no_lc_filter;
-    params.comp_adjust = !args.no_comp_adjust;
+    params.comp_adjust = if args.no_comp_adjust { 0 } else { args.comp_based_stats };
     if let Some(ws) = args.word_size { params.word_size = ws; }
     params.strand = args.strand.clone();
     params.query_gencode = args.query_gencode;
@@ -995,7 +1016,7 @@ fn run_tblastx(args: &BlastArgs) {
     let db_len      = db.volume_length();
 
     if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "tblastx", &db_path, "blast-cli 0.1.0").unwrap(); }
-    else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
+    else if fmt.fmt_id == 13 || fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
     if args.html {
         writeln!(out, "<!DOCTYPE html><html><head><title>BLAST Results</title>\
@@ -1006,7 +1027,7 @@ fn run_tblastx(args: &BlastArgs) {
     let filter = build_oid_filter(&db, args);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        if fmt.fmt_id == 15 && iter_num > 0 { writeln!(out, ",").unwrap(); }
+        if (fmt.fmt_id == 13 || fmt.fmt_id == 15) && iter_num > 0 { writeln!(out, ",").unwrap(); }
         let mut results = api_tblastx(&db, query_seq, &params);
         if let Some(ref f) = filter {
             results.retain(|r| f.contains(&r.subject_oid));
@@ -1017,7 +1038,7 @@ fn run_tblastx(args: &BlastArgs) {
             query_seq, query_len: query_seq.len(),
             matrix: "N/A", gap_open: params.gap_open, gap_extend: params.gap_extend,
             evalue_threshold: args.evalue, iter_num: iter_num + 1,
-            num_descriptions: None, num_alignments: None,
+            num_descriptions: None, num_alignments: None, taxdb: None,
         };
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
     }
@@ -1025,7 +1046,7 @@ fn run_tblastx(args: &BlastArgs) {
     if args.html { writeln!(out, "</body></html>").unwrap(); }
 
     if fmt.fmt_id == 5 { output::write_xml_footer(&mut out).unwrap(); }
-    else if fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
+    else if fmt.fmt_id == 13 || fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
 }
 
 // ── PSI-BLAST ────────────────────────────────────────────────────────────────
@@ -1056,14 +1077,14 @@ fn run_psiblast(args: &PsiblastArgs) {
     let matrix_name = args.matrix.as_str();
 
     if fmt.fmt_id == 5 { output::write_xml_header(&mut out, "psiblast", &db_path, "blast-cli 0.1.0").unwrap(); }
-    else if fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
+    else if fmt.fmt_id == 13 || fmt.fmt_id == 15 { output::write_json_header(&mut out).unwrap(); }
 
     let psi_params = PsiblastParams::new(params.clone())
         .num_iterations(args.num_iterations)
         .inclusion_evalue(args.inclusion_ethresh);
 
     for (iter_num, (query_title, query_seq)) in queries.iter().enumerate() {
-        if fmt.fmt_id == 15 && iter_num > 0 { writeln!(out, ",").unwrap(); }
+        if (fmt.fmt_id == 13 || fmt.fmt_id == 15) && iter_num > 0 { writeln!(out, ",").unwrap(); }
         let (results, pssm) = api_psiblast(&db, query_seq, &psi_params);
         let ctx = output::SearchContext {
             program: "psiblast", db_path: &db_path, db_title: &db_title,
@@ -1071,7 +1092,7 @@ fn run_psiblast(args: &PsiblastArgs) {
             query_seq, query_len: query_seq.len(),
             matrix: matrix_name, gap_open: params.gap_open, gap_extend: params.gap_extend,
             evalue_threshold: args.evalue, iter_num: iter_num + 1,
-            num_descriptions: None, num_alignments: None,
+            num_descriptions: None, num_alignments: None, taxdb: None,
         };
         output::write_results(&mut out, &fmt, &ctx, &results, Some(&db)).unwrap();
 
@@ -1098,7 +1119,7 @@ fn run_psiblast(args: &PsiblastArgs) {
     }
 
     if fmt.fmt_id == 5 { output::write_xml_footer(&mut out).unwrap(); }
-    else if fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
+    else if fmt.fmt_id == 13 || fmt.fmt_id == 15 { output::write_json_footer(&mut out).unwrap(); }
 }
 
 fn run_aliastool(args: &AliasArgs) {
@@ -1426,5 +1447,203 @@ fn read_fasta(path: &Path) -> io::Result<Vec<(String, Vec<u8>)>> {
         sequences.push((current_title, current_seq));
     }
     Ok(sequences)
+}
+
+// ── BLAST Formatter ─────────────────────────────────────────────────────────
+
+fn run_blast_formatter(args: &FormatterArgs) {
+    let archive = std::fs::read_to_string(&args.archive).unwrap_or_else(|e| {
+        eprintln!("Error reading archive: {}", e);
+        std::process::exit(1);
+    });
+
+    let fmt = output::OutputFormat::parse(&args.outfmt).unwrap_or_else(|e| {
+        eprintln!("Error parsing --outfmt: {}", e);
+        std::process::exit(1);
+    });
+
+    let mut out: Box<dyn Write> = match &args.out {
+        Some(p) => Box::new(std::io::BufWriter::new(
+            fs::File::create(p).unwrap_or_else(|e| { eprintln!("Error: {}", e); std::process::exit(1); })
+        )),
+        None => Box::new(std::io::BufWriter::new(std::io::stdout())),
+    };
+
+    // Parse the text ASN.1 archive to extract search metadata and results
+    let (program, db_path, query_title, query_len, results) = parse_archive_asn1(&archive);
+
+    let ctx = output::SearchContext {
+        program: &program,
+        db_path: &db_path,
+        db_title: &db_path,
+        db_num_seqs: 0,
+        db_len: 0,
+        query_title: &query_title,
+        query_seq: &[],
+        query_len,
+        matrix: "BLOSUM62",
+        gap_open: 11,
+        gap_extend: 1,
+        evalue_threshold: 10.0,
+        iter_num: 1,
+        num_descriptions: None,
+        num_alignments: None, taxdb: None,
+    };
+
+    output::write_results(&mut out, &fmt, &ctx, &results, None).unwrap();
+}
+
+/// Parse a text ASN.1 BLAST archive (format 11) into SearchResults.
+/// Splits by "type partial" alignment blocks for robust extraction.
+fn parse_archive_asn1(text: &str) -> (String, String, String, usize, Vec<blast_rs::SearchResult>) {
+    use blast_rs::{SearchResult, Hsp};
+
+    let mut program = String::from("blastp");
+    let mut db_path = String::new();
+    let mut query_title = String::new();
+    let mut query_len = 0usize;
+    let mut results: Vec<SearchResult> = Vec::new();
+
+    // Extract metadata from the request section
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("program \"") {
+            program = extract_quoted(t, "program ");
+        } else if t.starts_with("subject database \"") {
+            db_path = extract_quoted(t, "subject database ");
+        } else if t.starts_with("title \"") && query_title.is_empty() {
+            query_title = extract_quoted(t, "title ");
+        } else if t.starts_with("length ") && query_len == 0 {
+            query_len = t[7..].trim().parse().unwrap_or(0);
+        }
+    }
+
+    // Split text into alignment blocks (each starts with "type partial")
+    let blocks: Vec<&str> = text.split("type partial").skip(1).collect();
+
+    for block in blocks {
+        let mut score = 0i32;
+        let mut evalue = 0.0f64;
+        let mut bitscore = 0.0f64;
+        let mut nident = 0usize;
+        let mut _qid = String::new();
+        let mut sid = String::new();
+        let mut starts = Vec::new();
+        let mut lens = Vec::new();
+
+        let mut last_id_name = String::new();
+        let mut in_starts = false;
+        let mut in_lens = false;
+        let mut in_ids = false;
+        let mut id_count = 0;
+
+        for line in block.lines() {
+            let t = line.trim();
+
+            // Track which score field we're reading
+            if t.contains("id str \"score\"") { last_id_name = "score".into(); }
+            else if t.contains("id str \"e_value\"") { last_id_name = "e_value".into(); }
+            else if t.contains("id str \"bit_score\"") { last_id_name = "bit_score".into(); }
+            else if t.contains("id str \"num_ident\"") { last_id_name = "num_ident".into(); }
+
+            // Extract integer values
+            if let Some(rest) = t.strip_prefix("value int ") {
+                let v: i32 = rest.trim().parse().unwrap_or(0);
+                match last_id_name.as_str() {
+                    "score" => score = v,
+                    "num_ident" => nident = v as usize,
+                    _ => {}
+                }
+                last_id_name.clear();
+            }
+
+            // Extract real values: value real { mantissa, 10, exponent }
+            if t.starts_with("value real {") {
+                let inner = t.trim_start_matches("value real {").trim_end_matches('}').trim();
+                let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+                if parts.len() == 3 {
+                    let m: f64 = parts[0].parse().unwrap_or(0.0);
+                    let e: i32 = parts[2].parse().unwrap_or(0);
+                    let val = m * 10.0f64.powi(e);
+                    match last_id_name.as_str() {
+                        "e_value" => evalue = val,
+                        "bit_score" => bitscore = val,
+                        _ => {}
+                    }
+                }
+                last_id_name.clear();
+            }
+
+            // IDs
+            if t == "ids {" { in_ids = true; id_count = 0; }
+            if in_ids && t.starts_with("local str \"") {
+                let id = extract_quoted(t, "local str ");
+                if id_count == 0 { _qid = id; } else { sid = id; }
+                id_count += 1;
+                if id_count >= 2 { in_ids = false; }
+            }
+
+            // Starts array
+            if t == "starts {" { in_starts = true; starts.clear(); continue; }
+            if in_starts {
+                if t.starts_with('}') { in_starts = false; continue; }
+                if let Ok(v) = t.trim_end_matches(',').trim().parse::<usize>() {
+                    starts.push(v);
+                }
+                continue;
+            }
+
+            // Lens array
+            if t.starts_with("lens {") { in_lens = true; lens.clear(); continue; }
+            if in_lens {
+                if t.starts_with('}') { in_lens = false; continue; }
+                if let Ok(v) = t.trim_end_matches(',').trim().parse::<usize>() {
+                    lens.push(v);
+                }
+                continue;
+            }
+        }
+
+        // Build HSP if we have valid data
+        if !sid.is_empty() && !starts.is_empty() && !lens.is_empty() {
+            let q_start = starts.first().copied().unwrap_or(0);
+            let s_start = starts.get(1).copied().unwrap_or(0);
+            let aln_len = lens.first().copied().unwrap_or(0);
+
+            let hsp = Hsp {
+                score, bit_score: bitscore, evalue,
+                query_start: q_start, query_end: q_start + aln_len,
+                subject_start: s_start, subject_end: s_start + aln_len,
+                num_identities: nident, num_gaps: 0,
+                alignment_length: aln_len,
+                query_aln: vec![], midline: vec![], subject_aln: vec![],
+                query_frame: 0, subject_frame: 0,
+            };
+
+            if let Some(existing) = results.iter_mut().find(|r| r.subject_accession == sid) {
+                existing.hsps.push(hsp);
+            } else {
+                results.push(SearchResult {
+                    subject_oid: 0,
+                    subject_title: sid.clone(),
+                    subject_accession: sid,
+                    subject_len: s_start + aln_len,
+                    hsps: vec![hsp],
+                    taxids: vec![],
+                });
+            }
+        }
+    }
+
+    (program, db_path, query_title, query_len, results)
+}
+
+fn extract_quoted(line: &str, prefix: &str) -> String {
+    line.strip_prefix(prefix)
+        .unwrap_or(line)
+        .trim()
+        .trim_start_matches('"')
+        .trim_end_matches(['"', ',', ' '])
+        .to_string()
 }
 

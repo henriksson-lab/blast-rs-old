@@ -207,10 +207,16 @@ blast-cli blastp -q query.faa -d mydb --outfmt 5    # BLAST XML
 | 5 | BLAST XML |
 | 6 | Tabular |
 | 7 | Tabular with comment lines |
+| 8 | Seqalign (text ASN.1) |
+| 9 | Seqalign (binary ASN.1) |
 | 10 | Comma-separated (CSV) |
+| 11 | BLAST archive (ASN.1) |
+| 12 | Seqalign (JSON) |
+| 13 | Multiple-file BLAST JSON |
+| 14 | Multiple-file BLAST XML2 |
 | 15 | Single-file BLAST JSON |
 | 16 | Single-file BLAST XML2 |
-| 17 | Subject sequences as FASTA |
+| 18 | Organism Report |
 
 Tabular columns available: `qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen slen nident positive gaps ppos qseq sseq btop staxid salltitles qcovs qcovhsp score`
 
@@ -239,9 +245,9 @@ blast-cli dumpdb -d mydb --volumes
 |---------|-----------|
 | v4 protein (`.pin / .psq / .phr`) | read + write |
 | v4 nucleotide (`.nin / .nsq / .nhr`) | read + write |
-| v5 LMDB accession index (`.pdb / .ndb`) | read |
-| v5 OID→SeqIds (`.pos / .nos`) | read |
-| v5 OID→TaxIds (`.pot / .not`) | read |
+| v5 LMDB accession index (`.pdb / .ndb`) | read + write |
+| v5 OID→SeqIds (`.pos / .nos`) | read + write |
+| v5 OID→TaxIds (`.pot / .not`) | read + write |
 | Multi-volume databases | not yet |
 
 ## Scoring matrices

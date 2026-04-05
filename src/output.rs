@@ -24,6 +24,7 @@
 use std::io::{self, Write};
 use blast_rs::hsp::{Hsp, SearchResult};
 use blast_rs::db::BlastDb;
+use blast_rs::db::taxonomy::TaxDb;
 
 // ─── Public API ────────────────────────────────────────────────────────────
 
@@ -77,6 +78,8 @@ pub struct SearchContext<'a> {
     pub num_descriptions: Option<usize>,
     /// Maximum number of alignments to show (None = all)
     pub num_alignments: Option<usize>,
+    /// Taxonomy database for resolving taxid → organism names (None if unavailable)
+    pub taxdb: Option<&'a TaxDb>,
 }
 
 /// Write all results for one query in the requested format.
@@ -85,7 +88,7 @@ pub fn write_results(
     fmt: &OutputFormat,
     ctx: &SearchContext<'_>,
     results: &[SearchResult],
-    db: Option<&BlastDb>,
+    _db: Option<&BlastDb>,
 ) -> io::Result<()> {
     match fmt.fmt_id {
         0 => fmt0_pairwise(out, ctx, results, false, false),
@@ -101,11 +104,9 @@ pub fn write_results(
         12 => fmt12_seqalign_json(out, ctx, results),
         13 => fmt13_json_multi(out, ctx, results),
         14 => fmt14_xml2_multi(out, ctx, results),
-        18 => fmt18_sam(out, ctx, results),
         15 => fmt15_json(out, ctx, results),
         16 => fmt16_xml2(out, ctx, results),
-        17 => fmt17_fasta(out, ctx, results, db),
-        19 => write_results_html(out, ctx, results),
+        18 => fmt18_organism_report(out, ctx, results),
         _ => writeln!(out, "# Unknown output format {}.", fmt.fmt_id),
     }
 }
@@ -327,6 +328,15 @@ pub enum TabularColumn {
     Sacc,
     Sstrand,
     Qcovus,
+    // Taxonomy name columns
+    Ssciname,
+    Scomname,
+    Sblastname,
+    Sskingdom,
+    Sscinames,
+    Scomnames,
+    Sblastnames,
+    Sskingdoms,
 }
 
 impl TabularColumn {
@@ -365,6 +375,14 @@ impl TabularColumn {
             "sacc"       => Self::Sacc,
             "sstrand"    => Self::Sstrand,
             "qcovus"     => Self::Qcovus,
+            "ssciname"   => Self::Ssciname,
+            "scomname"   => Self::Scomname,
+            "sblastname" => Self::Sblastname,
+            "sskingdom"  => Self::Sskingdom,
+            "sscinames"  => Self::Sscinames,
+            "scomnames"  => Self::Scomnames,
+            "sblastnames"=> Self::Sblastnames,
+            "sskingdoms" => Self::Sskingdoms,
             _ => return None,
         })
     }
@@ -413,6 +431,14 @@ impl TabularColumn {
             Self::Sacc       => "sacc",
             Self::Sstrand    => "sstrand",
             Self::Qcovus     => "qcovus",
+            Self::Ssciname   => "ssciname",
+            Self::Scomname   => "scomname",
+            Self::Sblastname => "sblastname",
+            Self::Sskingdom  => "sskingdom",
+            Self::Sscinames  => "sscinames",
+            Self::Scomnames  => "scomnames",
+            Self::Sblastnames=> "sblastnames",
+            Self::Sskingdoms => "sskingdoms",
         }
     }
 }
@@ -493,7 +519,10 @@ fn tabular_field(
         TabularColumn::Qseq       => str_from_aln(&hsp.query_aln).to_string(),
         TabularColumn::Sseq       => str_from_aln(&hsp.subject_aln).to_string(),
         TabularColumn::Btop       => build_btop(&hsp.query_aln, &hsp.subject_aln),
-        TabularColumn::Staxid     => "N/A".to_string(),
+        TabularColumn::Staxid     => {
+            if r.taxids.is_empty() { "N/A".to_string() }
+            else { r.taxids.iter().map(|t| t.to_string()).collect::<Vec<_>>().join(";") }
+        }
         TabularColumn::Salltitles => r.subject_title.clone(),
         TabularColumn::Qcovs      => {
             if ctx.query_len == 0 { "0".to_string() }
@@ -525,7 +554,40 @@ fn tabular_field(
                 format!("{}", (100 * cov_len / ctx.query_len).min(100))
             }
         }
+        // Taxonomy name columns — resolve via TaxDb
+        TabularColumn::Ssciname => tax_field_single(r, ctx, |t| t.scientific_name.clone()),
+        TabularColumn::Scomname => tax_field_single(r, ctx, |t| t.common_name.clone()),
+        TabularColumn::Sblastname => tax_field_single(r, ctx, |t| t.blast_name.clone()),
+        TabularColumn::Sskingdom => tax_field_single(r, ctx, |t| t.kingdom.clone()),
+        TabularColumn::Sscinames => tax_field_multi(r, ctx, |t| t.scientific_name.clone()),
+        TabularColumn::Scomnames => tax_field_multi(r, ctx, |t| t.common_name.clone()),
+        TabularColumn::Sblastnames => tax_field_multi(r, ctx, |t| t.blast_name.clone()),
+        TabularColumn::Sskingdoms => tax_field_multi(r, ctx, |t| t.kingdom.clone()),
     }
+}
+
+/// Get a single taxonomy field (first taxid's value).
+fn tax_field_single(r: &SearchResult, ctx: &SearchContext<'_>, f: impl Fn(&blast_rs::db::taxonomy::TaxInfo) -> String) -> String {
+    if let (Some(taxdb), Some(&tid)) = (ctx.taxdb, r.taxids.first()) {
+        if let Some(info) = taxdb.lookup(tid) {
+            let val = f(&info);
+            if !val.is_empty() { return val; }
+        }
+    }
+    "N/A".to_string()
+}
+
+/// Get semicolon-separated taxonomy field (all taxids).
+fn tax_field_multi(r: &SearchResult, ctx: &SearchContext<'_>, f: impl Fn(&blast_rs::db::taxonomy::TaxInfo) -> String) -> String {
+    if let Some(taxdb) = ctx.taxdb {
+        let names: Vec<String> = r.taxids.iter()
+            .filter_map(|&tid| taxdb.lookup(tid))
+            .map(|info| f(&info))
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !names.is_empty() { return names.join(";"); }
+    }
+    "N/A".to_string()
 }
 
 // ─── Format 8: Text ASN.1 (Seq-annot) ─────────────────────────────────────
@@ -1312,151 +1374,84 @@ fn fmt16_xml2(
 
 // ─── Format 17: Subject FASTA sequences ────────────────────────────────────
 
-fn fmt17_fasta(
-    out: &mut impl Write,
-    _ctx: &SearchContext<'_>,
-    results: &[SearchResult],
-    db: Option<&BlastDb>,
-) -> io::Result<()> {
-    let db = match db {
-        Some(d) => d,
-        None => {
-            writeln!(out, "# Error: database not available for format 17")?;
-            return Ok(());
-        }
-    };
+// ─── Format 18: Organism Report (NCBI Tax BLAST report) ─────────────────
 
-    for r in results {
-        let sid = subject_title(r);
-        writeln!(out, ">{}", sid)?;
-
-        let seq: Vec<u8> = match db.seq_type() {
-            blast_rs::db::index::SeqType::Protein => {
-                db.get_sequence_protein(r.subject_oid).unwrap_or_default()
-            }
-            blast_rs::db::index::SeqType::Nucleotide => {
-                db.get_sequence_nucleotide(r.subject_oid).unwrap_or_default()
-            }
-        };
-
-        for chunk in seq.chunks(60) {
-            out.write_all(chunk)?;
-            writeln!(out)?;
-        }
-    }
-    Ok(())
-}
-
-// ─── Format 18: SAM ───────────────────────────────────────────────────────
-
-fn fmt18_sam(
+/// Organism Report matching NCBI BLAST+ format 18 output structure.
+/// Lists hits grouped by accession with score and E-value.
+/// Without taxonomy database, NCBI shows only headers — we match that behavior.
+fn fmt18_organism_report(
     out: &mut impl Write,
     ctx: &SearchContext<'_>,
     results: &[SearchResult],
 ) -> io::Result<()> {
-    // SAM header
-    writeln!(out, "@HD\tVN:1.6\tSO:queryname")?;
+    // Center the caption in 90 characters (matching NCBI's kFormatLineLength)
+    let caption = "Tax BLAST report";
+    let pad = 90usize.saturating_sub(caption.len()) / 2;
+    writeln!(out, "{:>width$}", caption, width = pad + caption.len())?;
+    writeln!(out)?;
+
+    // Query header
+    writeln!(out, "Query= {}", ctx.query_title)?;
+    writeln!(out)?;
+    writeln!(out, "Length={}", ctx.query_len)?;
+    writeln!(out)?;
+
+    // Organism Report header
+    let org_caption = "Organism Report";
+    let org_pad = 90usize.saturating_sub(org_caption.len()) / 2;
+    writeln!(out, "{:>width$}", org_caption, width = org_pad + org_caption.len())?;
+
+    // Column headers
+    writeln!(out, "{:<40}{:<40}{:>8} E-value", "Accession", "Description", "Score")?;
+
+    // Group hits by taxonomy ID (matches NCBI when taxdb is available)
+    use std::collections::BTreeMap;
+    let mut by_taxid: BTreeMap<i32, Vec<&SearchResult>> = BTreeMap::new();
+    let mut no_taxid: Vec<&SearchResult> = Vec::new();
     for r in results {
-        writeln!(out, "@SQ\tSN:{}\tLN:{}", r.subject_accession, r.subject_len)?;
-    }
-    writeln!(out, "@PG\tID:blast-cli\tPN:{}\tVN:0.1.0", ctx.program)?;
-
-    let qname = first_word(ctx.query_title);
-
-    for r in results {
-        let rname = if !r.subject_accession.is_empty() { &r.subject_accession } else { &r.subject_title };
-
-        for hsp in &r.hsps {
-            // FLAG: 0 for forward, 16 for reverse
-            let flag = if hsp.subject_frame < 0 || hsp.query_frame < 0 { 16 } else { 0 };
-
-            // POS: 1-based subject start
-            let pos = hsp.subject_start + 1;
-
-            // MAPQ: derived from e-value (approximate)
-            let mapq = if hsp.evalue <= 0.0 { 255 }
-                else { ((-10.0 * hsp.evalue.log10()).clamp(0.0, 255.0)) as u8 };
-
-            // Build CIGAR from alignment
-            let cigar = build_cigar(&hsp.query_aln, &hsp.subject_aln);
-
-            // SEQ: query sequence from alignment (gaps removed)
-            let seq: String = hsp.query_aln.iter()
-                .filter(|&&b| b != b'-')
-                .map(|&b| b as char)
-                .collect();
-
-            // QUAL: unavailable
-            let qual = "*";
-
-            // Optional fields
-            let as_tag = format!("AS:i:{}", hsp.score);
-            let bs_tag = format!("BS:f:{:.1}", hsp.bit_score);
-            let ev_tag = format!("EV:f:{:.2e}", hsp.evalue);
-            let nm_tag = format!("NM:i:{}", hsp.alignment_length - hsp.num_identities);
-
-            writeln!(out, "{}\t{}\t{}\t{}\t{}\t{}\t*\t0\t0\t{}\t{}\t{}\t{}\t{}\t{}",
-                qname, flag, rname, pos, mapq, cigar, seq, qual,
-                as_tag, bs_tag, ev_tag, nm_tag)?;
-        }
-    }
-    Ok(())
-}
-
-/// Build a CIGAR string from query and subject alignment strings.
-fn build_cigar(query_aln: &[u8], subject_aln: &[u8]) -> String {
-    let mut cigar = String::new();
-    let mut last_op = ' ';
-    let mut run = 0usize;
-
-    for (&q, &s) in query_aln.iter().zip(subject_aln.iter()) {
-        let op = if q == b'-' {
-            'D' // deletion from reference (gap in query)
-        } else if s == b'-' {
-            'I' // insertion to reference (gap in subject)
+        if r.taxids.is_empty() {
+            no_taxid.push(r);
         } else {
-            'M' // alignment match (or mismatch)
-        };
-
-        if op == last_op {
-            run += 1;
-        } else {
-            if run > 0 {
-                cigar.push_str(&format!("{}{}", run, last_op));
+            for &tid in &r.taxids {
+                by_taxid.entry(tid).or_default().push(r);
             }
-            last_op = op;
-            run = 1;
         }
     }
-    if run > 0 {
-        cigar.push_str(&format!("{}{}", run, last_op));
+
+    // Print grouped by taxid
+    for (tid, hits) in &by_taxid {
+        // Resolve taxid → organism name if taxdb available
+        let org_name = ctx.taxdb
+            .and_then(|db| db.lookup(*tid))
+            .map(|info| info.scientific_name)
+            .unwrap_or_default();
+        if org_name.is_empty() {
+            writeln!(out, "\n  Taxonomy ID: {}", tid)?;
+        } else {
+            writeln!(out, "\n  {} [taxid: {}]", org_name, tid)?;
+        }
+        for r in hits {
+            let acc = if !r.subject_accession.is_empty() { &r.subject_accession } else { "N/A" };
+            let desc = if !r.subject_title.is_empty() {
+                if r.subject_title.len() > 38 { &r.subject_title[..38] } else { &r.subject_title }
+            } else { "" };
+            let best_score = r.hsps.first().map(|h| h.bit_score).unwrap_or(0.0);
+            writeln!(out, "  {:<38}{:<40}{:>5.0} {:.2e}", acc, desc, best_score, r.best_evalue())?;
+        }
     }
-
-    if cigar.is_empty() { "*".to_string() } else { cigar }
-}
-
-// ─── HTML output ───────────────────────────────────────────────────────────
-
-/// Write results in HTML format (wraps pairwise output in HTML).
-pub fn write_results_html(
-    out: &mut impl Write,
-    ctx: &SearchContext<'_>,
-    results: &[SearchResult],
-) -> io::Result<()> {
-    writeln!(out, "<!DOCTYPE html>")?;
-    writeln!(out, "<html><head><title>BLAST Results</title>")?;
-    writeln!(out, "<style>")?;
-    writeln!(out, "body {{ font-family: monospace; white-space: pre; }}")?;
-    writeln!(out, ".header {{ color: #333; font-weight: bold; }}")?;
-    writeln!(out, ".hit-title {{ color: #006; }}")?;
-    writeln!(out, ".score {{ color: #060; }}")?;
-    writeln!(out, "a {{ color: #009; }}")?;
-    writeln!(out, "</style></head><body>")?;
-
-    // Use pairwise format inside the HTML body
-    fmt0_pairwise(out, ctx, results, false, false)?;
-
-    writeln!(out, "</body></html>")
+    // Print ungrouped hits (no taxonomy data)
+    if !no_taxid.is_empty() && !by_taxid.is_empty() {
+        writeln!(out, "\n  No taxonomy data:")?;
+    }
+    for r in &no_taxid {
+        let acc = if !r.subject_accession.is_empty() { &r.subject_accession } else { "N/A" };
+        let desc = if !r.subject_title.is_empty() {
+            if r.subject_title.len() > 38 { &r.subject_title[..38] } else { &r.subject_title }
+        } else { "" };
+        let best_score = r.hsps.first().map(|h| h.bit_score).unwrap_or(0.0);
+        writeln!(out, "{:<40}{:<40}{:>5.0} {:.2e}", acc, desc, best_score, r.best_evalue())?;
+    }
+    writeln!(out)
 }
 
 // ─── Shared alignment helpers ───────────────────────────────────────────────

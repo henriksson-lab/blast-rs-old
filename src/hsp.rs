@@ -44,6 +44,9 @@ pub struct SearchResult {
     pub subject_accession: String,
     pub subject_len: usize,
     pub hsps: Vec<Hsp>,
+    /// Taxonomy IDs for this subject (from v5 database .pot/.not files).
+    /// Empty if database doesn't have taxonomy data.
+    pub taxids: Vec<i32>,
 }
 
 impl SearchResult {

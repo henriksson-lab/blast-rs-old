@@ -30,4 +30,4 @@ pub use api::{blastp, blastn, blastx, tblastn, tblastx, psiblast, PsiblastParams
 pub use search::{blastn_search, blastx_search, tblastn_search, tblastx_search, dc_megablast_search};
 
 // Re-export BlastDb types so users need only one dependency
-pub use crate::db::{BlastDb, BlastDefLine, BlastDbBuilder, SequenceEntry};
+pub use crate::db::{BlastDb, BlastDefLine, BlastDbBuilder, SequenceEntry, TaxDb};

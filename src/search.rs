@@ -10,7 +10,7 @@ use crate::lookup::{ProteinLookup, NucleotideLookup, DiscontiguousLookup};
 use crate::extend::{ungapped_extend, gapped_extend, gapped_extend_score_only, ungapped_extend_nucleotide};
 use crate::hsp::{Hsp, SearchResult};
 use crate::translate::{six_frame_translate_with_code, strip_stops, TranslatedFrame, reverse_complement};
-use crate::compo::{composition_ncbistdaa, adjust_evalue};
+use crate::compo::{composition_ncbistdaa, adjust_evalue_with_mode};
 
 /// Parameters for a BLAST search.
 #[derive(Debug, Clone)]
@@ -32,8 +32,8 @@ pub struct SearchParams {
     pub num_threads: usize,
     /// Apply SEG masking to protein queries/subjects.
     pub filter_low_complexity: bool,
-    /// Apply composition-based statistics adjustment.
-    pub comp_adjust: bool,
+    /// Composition-based statistics mode: 0=off, 1=unconditional, 2=conditional, 3=forced.
+    pub comp_adjust: u8,
     /// Query strand: "both", "plus", or "minus" (for nucleotide searches).
     pub strand: String,
     /// Genetic code for query translation (1=standard, 2=vert mito, etc.)
@@ -72,7 +72,7 @@ impl SearchParams {
             match_score: 2, mismatch: -3,
             num_threads: 0,
             filter_low_complexity: true,
-            comp_adjust: true,
+            comp_adjust: 1, // mode 1: unconditional composition-based stats
             strand: "both".to_string(),
             query_gencode: 1,
             db_gencode: 1,
@@ -97,7 +97,7 @@ impl SearchParams {
             match_score: 2, mismatch: -3,
             num_threads: 0,
             filter_low_complexity: true,
-            comp_adjust: false, // composition adjustment not standard for blastn
+            comp_adjust: 0, // composition adjustment not standard for blastn
             strand: "both".to_string(),
             query_gencode: 1,
             db_gencode: 1,
@@ -151,7 +151,7 @@ impl SearchParams {
     pub fn gap_open(mut self, v: i32) -> Self { self.gap_open = v; self }
     pub fn gap_extend(mut self, v: i32) -> Self { self.gap_extend = v; self }
     pub fn filter_low_complexity(mut self, v: bool) -> Self { self.filter_low_complexity = v; self }
-    pub fn comp_adjust(mut self, v: bool) -> Self { self.comp_adjust = v; self }
+    pub fn comp_adjust(mut self, v: u8) -> Self { self.comp_adjust = v; self }
     pub fn match_score(mut self, v: i32) -> Self { self.match_score = v; self }
     pub fn mismatch(mut self, v: i32) -> Self { self.mismatch = v; self }
     pub fn strand(mut self, v: &str) -> Self { self.strand = v.to_string(); self }
@@ -263,7 +263,8 @@ pub fn blast_search(
         capped_trigger
     };
 
-    let query_comp = if params.comp_adjust { Some(composition_ncbistdaa(query_for_extend)) } else { None };
+    let query_comp = if params.comp_adjust > 0 { Some(composition_ncbistdaa(query_for_extend)) } else { None };
+    let comp_mode = params.comp_adjust;
 
     // Precompute query score profile for fast ungapped extension:
     // profile[q_residue][s_residue] = score, accessed as profile[query[i]][subject[j]]
@@ -303,13 +304,14 @@ pub fn blast_search(
             )
         });
 
-        // Composition adjustment
+        // Composition adjustment (mode 0=off, 1=unconditional, 2=conditional, 3=forced)
         if let Some(ref qc) = query_comp {
             let sc = composition_ncbistdaa(subject);
             for hsp in &mut hsps {
-                hsp.evalue = adjust_evalue(
+                hsp.evalue = adjust_evalue_with_mode(
                     hsp.evalue, hsp.score, qc, &sc, &matrix,
                     ka.lambda, ka.k, eff_query_len, eff_db_len,
+                    comp_mode,
                 );
             }
             hsps.retain(|h| h.evalue <= params.evalue_threshold);
@@ -322,12 +324,16 @@ pub fn blast_search(
         }
 
         let header = db.get_header(oid).unwrap_or_default();
+        let taxids = db.get_taxids(oid)
+            .and_then(|r| r.ok())
+            .unwrap_or_default();
         Some(SearchResult {
             subject_oid: oid,
             subject_title: header.title,
             subject_accession: header.accession,
             subject_len: subject.len(),
             hsps,
+            taxids,
         })
     }).collect();
 
@@ -1345,12 +1351,14 @@ pub fn blastn_search(
             if hsps.is_empty() { return None; }
 
             let header = db.get_header(oid).unwrap_or_default();
+            let taxids = db.get_taxids(oid).and_then(|r| r.ok()).unwrap_or_default();
             Some(SearchResult {
                 subject_oid: oid,
                 subject_title: header.title,
                 subject_accession: header.accession,
                 subject_len: subject.len(),
                 hsps,
+                taxids,
             })
         }).collect();
 
@@ -1584,7 +1592,7 @@ pub fn blastx_search(
 
         let mut frame_params = params.clone();
         frame_params.filter_low_complexity = false; // already applied
-        frame_params.comp_adjust = false; // apply below with actual coords
+        frame_params.comp_adjust = 0; // apply below with actual coords
 
         let frame_results = blast_search(db, &query_ncbi, &frame_params);
 
@@ -1693,12 +1701,14 @@ pub fn tblastn_search(
         }
 
         let header = db.get_header(oid).unwrap_or_default();
+        let taxids = db.get_taxids(oid).and_then(|r| r.ok()).unwrap_or_default();
         Some(SearchResult {
             subject_oid: oid,
             subject_title: header.title,
             subject_accession: header.accession,
-            subject_len: nt_subject.len(), // report nucleotide length
+            subject_len: nt_subject.len(),
             hsps: all_hsps,
+            taxids,
         })
     }).collect();
 
@@ -1798,12 +1808,14 @@ pub fn tblastx_search(
         }
 
         let header = db.get_header(oid).unwrap_or_default();
+        let taxids = db.get_taxids(oid).and_then(|r| r.ok()).unwrap_or_default();
         Some(SearchResult {
             subject_oid: oid,
             subject_title: header.title,
             subject_accession: header.accession,
             subject_len: nt_subject.len(),
             hsps: all_hsps,
+            taxids,
         })
     }).collect();
 
@@ -1885,12 +1897,14 @@ pub fn dc_megablast_search(
         hsps.sort_by(|a, b| a.evalue.partial_cmp(&b.evalue).unwrap_or(std::cmp::Ordering::Equal));
 
         let header = db.get_header(oid).unwrap_or_default();
+        let taxids = db.get_taxids(oid).and_then(|r| r.ok()).unwrap_or_default();
         Some(SearchResult {
             subject_oid: oid,
             subject_title: header.title,
             subject_accession: header.accession,
             subject_len: subject.len(),
             hsps,
+            taxids,
         })
     }).collect();
 
