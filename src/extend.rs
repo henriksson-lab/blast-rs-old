@@ -258,6 +258,10 @@ pub struct UngappedHit {
     pub q_end: usize,   // exclusive
     pub s_start: usize,
     pub s_end: usize,   // exclusive
+    /// Original seed position in query (word start)
+    pub q_seed: usize,
+    /// Original seed position in subject (word start)
+    pub s_seed: usize,
 }
 
 /// Perform ungapped extension from a seed position.
@@ -347,6 +351,8 @@ fn ungapped_extend_profile(
         q_start,
         q_end: best_q_end,
         s_start,
+        q_seed: q_pos,
+        s_seed: s_pos,
         s_end: best_s_end,
     }
 }
@@ -430,6 +436,17 @@ pub fn gapped_extend(
     midline.extend_from_slice(&right.midline);
     subject_aln.extend_from_slice(&right.subject_aln);
 
+    // Trim alignment to maximal-scoring sub-segment.
+    // This removes leading/trailing mismatches that reduce the alignment score,
+    // matching NCBI BLAST+'s behavior of reporting only the highest-scoring
+    // contiguous sub-alignment.
+    let (query_aln, midline, subject_aln, q_start, q_end, s_start, s_end) =
+        trim_alignment_to_max_score(
+            query_aln, midline, subject_aln,
+            q_start, q_end, s_start, s_end,
+            matrix, gap_open, gap_extend,
+        );
+
     let num_identities = midline.iter().filter(|&&c| c == b'|').count();
     let num_gaps = query_aln.iter().filter(|&&c| c == b'-').count()
         + subject_aln.iter().filter(|&&c| c == b'-').count();
@@ -446,6 +463,90 @@ pub fn gapped_extend(
         midline,
         subject_aln,
     }
+}
+
+/// Trim leading and trailing non-identity positions from an alignment.
+///
+/// NCBI BLAST+ trims alignment ends that contain mismatches or gaps,
+/// keeping only the portion bounded by identity positions on both ends.
+/// This prevents positive-scoring mismatches (e.g., BLOSUM62 L/M = +2)
+/// from inflating alignment boundaries beyond the actual matching region.
+#[allow(clippy::too_many_arguments)]
+fn trim_alignment_to_max_score(
+    query_aln: Vec<u8>,
+    midline: Vec<u8>,
+    subject_aln: Vec<u8>,
+    q_start: usize,
+    q_end: usize,
+    s_start: usize,
+    s_end: usize,
+    _matrix: &ScoringMatrix,
+    _gap_open: i32,
+    _gap_extend: i32,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>, usize, usize, usize, usize) {
+    let aln_len = query_aln.len();
+    if aln_len == 0 {
+        return (query_aln, midline, subject_aln, q_start, q_end, s_start, s_end);
+    }
+
+    // Find first identity from left
+    let mut trim_left = 0;
+    for i in 0..aln_len {
+        if midline[i] == b'|' {
+            trim_left = i;
+            break;
+        }
+    }
+
+    // Find last identity from right
+    let mut trim_right = aln_len;
+    for i in (0..aln_len).rev() {
+        if midline[i] == b'|' {
+            trim_right = i + 1;
+            break;
+        }
+    }
+
+    if trim_left >= trim_right || (trim_left == 0 && trim_right == aln_len) {
+        return (query_aln, midline, subject_aln, q_start, q_end, s_start, s_end);
+    }
+
+    // Count query/subject positions consumed in trimmed prefix/suffix
+    let mut q_trim_left = 0usize;
+    let mut s_trim_left = 0usize;
+    for i in 0..trim_left {
+        if query_aln[i] != b'-' {
+            q_trim_left += 1;
+        }
+        if subject_aln[i] != b'-' {
+            s_trim_left += 1;
+        }
+    }
+    let mut q_trim_right = 0usize;
+    let mut s_trim_right = 0usize;
+    for i in trim_right..aln_len {
+        if query_aln[i] != b'-' {
+            q_trim_right += 1;
+        }
+        if subject_aln[i] != b'-' {
+            s_trim_right += 1;
+        }
+    }
+
+    let new_q_start = q_start + q_trim_left;
+    let new_q_end = q_end - q_trim_right;
+    let new_s_start = s_start + s_trim_left;
+    let new_s_end = s_end - s_trim_right;
+
+    (
+        query_aln[trim_left..trim_right].to_vec(),
+        midline[trim_left..trim_right].to_vec(),
+        subject_aln[trim_left..trim_right].to_vec(),
+        new_q_start,
+        new_q_end,
+        new_s_start,
+        new_s_end,
+    )
 }
 
 /// Score-only gapped extension (no traceback, no alignment strings).
@@ -882,5 +983,7 @@ pub fn ungapped_extend_nucleotide(
         q_end: best_q_end,
         s_start,
         s_end: best_s_end,
+        q_seed: q_pos,
+        s_seed: s_pos,
     }
 }

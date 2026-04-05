@@ -1234,12 +1234,12 @@ fn search_one_protein(
     let mut covered_query: Vec<bool> = vec![false; query.len()];
 
     for uh in ungapped_hits {
-        let center_q = (uh.q_start + uh.q_end) / 2;
+        let center_q = uh.q_seed;
         if center_q < covered_query.len() && covered_query[center_q] {
             continue;
         }
 
-        let center_s = (uh.s_start + uh.s_end) / 2;
+        let center_s = uh.s_seed;
 
         // Stage 1: quick score-only check (match NCBI: raw score threshold)
         let prelim_score = gapped_extend_score_only(
@@ -1479,9 +1479,9 @@ fn search_one_nucleotide(
     let mut covered: Vec<bool> = vec![false; query.len()];
 
     for uh in ungapped_hits {
-        let center_q = (uh.q_start + uh.q_end) / 2;
+        let center_q = uh.q_seed;
         if center_q < covered.len() && covered[center_q] { continue; }
-        let center_s = (uh.s_start + uh.s_end) / 2;
+        let center_s = uh.s_seed;
 
         let gh = gapped_extend(
             &query_2bit, &subject_2bit,
@@ -1882,8 +1882,8 @@ pub fn dc_megablast_search(
             if hit.score > 0 {
                 if diag < diag_hit.len() { diag_hit[diag] = true; }
 
-                let center_q = (hit.q_start + hit.q_end) / 2;
-                let center_s = (hit.s_start + hit.s_end) / 2;
+                let center_q = hit.q_seed;
+                let center_s = hit.s_seed;
                 let gh = gapped_extend(&query_2bit, &subject_2bit, center_q, center_s, &nt_matrix,
                     params.gap_open, params.gap_extend, params.x_drop_gapped);
                 if gh.score <= 0 { continue; }
