@@ -25,7 +25,7 @@ Add to `Cargo.toml`:
 
 ```toml
 [dependencies]
-blast-rs = { git = "https://github.com/henriksson-lab/blast-rs" }
+blast-rs = "0.1"
 ```
 
 ### Protein search (blastp)
