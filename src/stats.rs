@@ -28,23 +28,76 @@ impl KarlinAltschul {
         (self.lambda * score as f64 - self.k.ln()) / 2.0f64.ln()
     }
 
-    /// Effective lengths: the effective query/subject lengths account for
-    /// the fact that alignments cannot extend to the very ends.
+    /// Effective lengths using NCBI's iterative fixed-point algorithm.
+    ///
+    /// Solves: `ell = (alpha/lambda) * (ln(K) + ln((m-ell)(n-N*ell))) + beta`
+    /// where m = query_len, n = db_len, N = num_seqs.
+    ///
+    /// Returns (effective_query_len, effective_db_len) where both are reduced
+    /// by the same length_adjustment.
     pub fn effective_lengths(
         &self,
         query_len: usize,
         db_len: u64,
         num_seqs: u64,
     ) -> (usize, u64) {
-        // Effective length = length - (ln(K * length) / H)
+        let m = query_len as f64;
+        let n = db_len as f64;
+        let nn = num_seqs as f64;
         let log_k = self.k.ln();
-        let ql = query_len as f64;
-        let dl = db_len as f64;
-        let h = self.h;
-        let eff_query = (ql - (log_k + ql.ln()) / h).max(1.0) as usize;
-        let eff_db_per = (dl / num_seqs as f64 - (log_k + dl.ln()) / h).max(1.0);
-        let eff_db = ((eff_db_per * num_seqs as f64) as u64).max(1);
-        (eff_query, eff_db)
+        let alpha_d_lambda = self.alpha / self.lambda;
+        let beta = self.beta;
+
+        // Compute ell_max: largest ell where K*(m-ell)*(n-N*ell) > max(m,n)
+        let a = nn;
+        let mb = m * nn + n;
+        let c = n * m - m.max(n) / self.k;
+
+        if c < 0.0 {
+            return (query_len.max(1), db_len.max(1));
+        }
+
+        let ell_max = 2.0 * c / (mb + (mb * mb - 4.0 * a * c).max(0.0).sqrt());
+
+        // Iterative fixed-point solver (NCBI BLAST_ComputeLengthAdjustment)
+        let mut ell_min = 0.0f64;
+        let mut ell_max = ell_max;
+        let mut ell_next = 0.0f64;
+        for i in 1..=20 {
+            let ell = ell_next;
+            let ss = (m - ell) * (n - nn * ell);
+            if ss <= 0.0 { break; }
+            let ell_bar = alpha_d_lambda * (log_k + ss.ln()) + beta;
+
+            if ell_bar >= ell {
+                ell_min = ell;
+                if ell_bar - ell_min <= 1.0 { break; }
+                if ell_min == ell_max { break; }
+            } else {
+                ell_max = ell;
+            }
+
+            if ell_min <= ell_bar && ell_bar <= ell_max {
+                ell_next = ell_bar;
+            } else {
+                ell_next = if i == 1 { ell_max } else { (ell_min + ell_max) / 2.0 };
+            }
+        }
+
+        let mut length_adj = ell_min as i64;
+
+        // Verify ceiling (NCBI lines 5112-5118)
+        let ell_ceil = ell_min.ceil();
+        if ell_ceil <= ell_max {
+            let ss = (m - ell_ceil) * (n - nn * ell_ceil);
+            if ss > 0.0 && alpha_d_lambda * (log_k + ss.ln()) + beta >= ell_ceil {
+                length_adj = ell_ceil as i64;
+            }
+        }
+
+        let eff_q = (query_len as i64 - length_adj).max(1) as usize;
+        let eff_db = (db_len as i64 - num_seqs as i64 * length_adj).max(1) as u64;
+        (eff_q, eff_db)
     }
 }
 

@@ -168,6 +168,21 @@ impl SearchParams {
 
 /// Neighbor word score threshold for protein lookup.
 /// BLAST uses T=11 for BLOSUM62, word_size=3.
+/// Ungapped Karlin-Altschul parameters (lambda, K) for gap_trigger computation.
+/// NCBI uses kbp_std (ungapped params) not kbp_gap for the gap_trigger formula.
+fn ungapped_ka_params(matrix: MatrixType) -> (f64, f64) {
+    match matrix {
+        MatrixType::Blosum62 => (0.3176, 0.134),
+        MatrixType::Blosum45 => (0.2291, 0.0924),
+        MatrixType::Blosum50 => (0.2326, 0.0450),
+        MatrixType::Blosum80 => (0.3430, 0.177),
+        MatrixType::Blosum90 => (0.3346, 0.190),
+        MatrixType::Pam30    => (0.3400, 0.283),
+        MatrixType::Pam70    => (0.3345, 0.310),
+        MatrixType::Pam250   => (0.2252, 0.0868),
+    }
+}
+
 pub(crate) fn neighbor_threshold(matrix: MatrixType, word_size: usize) -> i32 {
     match (matrix, word_size) {
         (MatrixType::Blosum62, 3) => 11,
@@ -183,18 +198,6 @@ pub(crate) fn neighbor_threshold(matrix: MatrixType, word_size: usize) -> i32 {
     }
 }
 
-/// Adjust neighbor word threshold based on query length.
-/// Longer queries generate more seed hits per subject; raising the threshold
-/// reduces false positives while maintaining sensitivity (matches NCBI behavior).
-fn adjusted_threshold(base: i32, query_len: usize) -> i32 {
-    if query_len > 500 {
-        base + 2
-    } else if query_len > 200 {
-        base + 1
-    } else {
-        base
-    }
-}
 
 /// Run a protein BLAST search (blastp).
 pub fn blast_search(
@@ -234,8 +237,7 @@ pub fn blast_search(
     let num_seqs = db.num_sequences() as u64;
     let (eff_query_len, eff_db_len) = ka.effective_lengths(query_for_lookup.len(), db_len, num_seqs);
 
-    let base_threshold = neighbor_threshold(params.matrix, params.word_size);
-    let threshold = adjusted_threshold(base_threshold, query_for_lookup.len());
+    let threshold = neighbor_threshold(params.matrix, params.word_size);
     let lookup = ProteinLookup::build(query_for_lookup, params.word_size, &matrix, threshold);
 
     // NCBI-style two-threshold approach:
@@ -243,12 +245,22 @@ pub fn blast_search(
     // 2. gap_trigger: minimum ungapped score to attempt gapped extension (higher — saves time)
     // Hits below gap_trigger are kept but not gapped-extended; they may still appear in output
     // if they pass the evalue threshold based on ungapped score alone.
+    // NCBI uses UNGAPPED KA parameters (kbp_std) for gap_trigger, not gapped params.
+    // Ungapped params have higher lambda and K, giving a lower gap_trigger threshold.
+    let (ug_lambda, ug_k) = ungapped_ka_params(params.matrix);
     let gap_trigger_bits = 22.0f64;
-    let gap_trigger_score = ((gap_trigger_bits * std::f64::consts::LN_2 + ka.k.ln()) / ka.lambda) as i32;
+    let gap_trigger_score = ((gap_trigger_bits * std::f64::consts::LN_2 + ug_k.ln()) / ug_lambda) as i32;
+    // Match NCBI: ungapped hits must meet gap_trigger to be saved for gapped extension.
+    // Cap at the maximum achievable score for the query (NCBI's cutoff_score_max),
+    // so short queries aren't filtered too aggressively.
+    let max_self_score: i32 = query_for_extend.iter()
+        .map(|&q| matrix.scores[q as usize % 28][q as usize % 28])
+        .sum();
+    let capped_trigger = gap_trigger_score.max(1).min(max_self_score);
     let effective_cutoff = if params.ungapped_cutoff > 0 {
         params.ungapped_cutoff
     } else {
-        1 // Keep all ungapped hits with score > 0
+        capped_trigger
     };
 
     let query_comp = if params.comp_adjust { Some(composition_ncbistdaa(query_for_extend)) } else { None };
@@ -287,7 +299,7 @@ pub fn blast_search(
             search_one_protein_scratch(
                 query_for_extend, subject, &lookup, &matrix, &ka, params,
                 eff_query_len, eff_db_len, &score_profile, &mut scratch,
-                effective_cutoff, gap_trigger_score,
+                effective_cutoff, capped_trigger,
             )
         });
 
@@ -530,37 +542,31 @@ fn search_one_protein_scratch(
     scratch.reset_covered(query.len());
     let mut hsps = Vec::new();
 
-    for &(score, qs, qe, ss, se) in &scratch.ungapped_hits {
+    for &(_, qs, qe, ss, se) in &scratch.ungapped_hits {
         let center_q = (qs + qe) / 2;
         if center_q < query.len() && scratch.covered_query[center_q] { continue; }
         let center_s = (ss + se) / 2;
 
-        // Only attempt gapped extension if ungapped score meets the gap trigger threshold.
-        // Lower-scoring hits are still kept as ungapped HSPs if they pass the evalue threshold.
-        if score < gap_trigger {
-            // Below gap trigger: skip gapped extension only if the ungapped
-            // evalue already exceeds the threshold. Otherwise, do gapped
-            // extension anyway to produce a proper alignment.
-            let ug_evalue = ka.evalue(score, eff_query_len, eff_db_len);
-            if ug_evalue > params.evalue_threshold { continue; }
-            // Falls through to gapped extension below — this hit has a good
-            // enough ungapped score to potentially produce a significant gapped alignment.
-        }
+        // Match NCBI: all saved hits (score >= gap_trigger) get gapped extension.
+        // No additional threshold check needed here — effective_cutoff already
+        // filtered at save time.
 
+        // Stage 1: preliminary score-only extension (fast rejection)
         let prelim_score = gapped_extend_score_only(
             query, subject, center_q, center_s, matrix,
             params.gap_open, params.gap_extend, params.x_drop_gapped,
         );
-        if prelim_score <= 0 { continue; }
-        let prelim_evalue = ka.evalue(prelim_score, eff_query_len, eff_db_len);
-        if prelim_evalue > params.evalue_threshold { continue; }
+        // Match NCBI: check raw score against gap_trigger (same as ungapped cutoff)
+        if prelim_score < gap_trigger { continue; }
 
+        // Stage 2: full extension with traceback
         let final_x_drop = params.x_drop_final.max(params.x_drop_gapped);
         let gh = gapped_extend(
             query, subject, center_q, center_s, matrix,
             params.gap_open, params.gap_extend, final_x_drop,
         );
-        if gh.score <= 0 { continue; }
+        // Match NCBI: gapped result must also meet cutoff_score
+        if gh.score < gap_trigger { continue; }
         let evalue = ka.evalue(gh.score, eff_query_len, eff_db_len);
         if evalue > params.evalue_threshold { continue; }
 
@@ -597,7 +603,9 @@ fn search_one_protein_scratch(
     hsps
 }
 
-/// Inline ungapped extension using precomputed score profile.
+/// Inline ungapped extension matching NCBI's s_BlastAaExtendTwoHit behavior.
+/// First scans word_size positions from the seed to find the best starting point,
+/// then extends left and right from that refined position.
 /// Returns (score, q_start, q_end, s_start, s_end).
 #[inline]
 fn ungapped_extend_inline(
@@ -606,14 +614,33 @@ fn ungapped_extend_inline(
 ) -> (i32, usize, usize, usize, usize) {
     let slen = subject.len();
     let qlen = query.len();
-    let mut best = 0i32;
-    let mut best_q_start = q_pos;
-    let mut best_s_start = s_pos;
 
-    // Extend left
+    // NCBI word-scan: find best starting position within word_size positions
+    // from the seed (matches s_BlastAaExtendTwoHit lines 1104-1121)
+    let ws = 3usize; // word_size
+    let mut scan_score = 0i32;
+    let mut best_scan = 0i32;
+    let mut right_d = 0usize;
+    let scan_end = ws.min(qlen - q_pos).min(slen - s_pos);
+    for i in 0..scan_end {
+        scan_score += score_profile[q_pos + i][subject[s_pos + i] as usize];
+        if scan_score > best_scan {
+            best_scan = scan_score;
+            right_d = i + 1;
+        }
+    }
+
+    // Refined starting position (one beyond the best word position)
+    let ext_q = q_pos + right_d;
+    let ext_s = s_pos + right_d;
+
+    // Extend left from refined position
+    let mut best = 0i32;
+    let mut best_q_start = ext_q;
+    let mut best_s_start = ext_s;
     let mut score = 0i32;
-    let mut qi = q_pos;
-    let mut si = s_pos;
+    let mut qi = ext_q;
+    let mut si = ext_s;
     while qi > 0 && si > 0 {
         qi -= 1;
         si -= 1;
@@ -628,13 +655,13 @@ fn ungapped_extend_inline(
     }
     let left_score = best;
 
-    // Extend right
-    qi = q_pos;
-    si = s_pos;
+    // Extend right from refined position
+    qi = ext_q;
+    si = ext_s;
     score = 0;
     best = 0;
-    let mut best_q_end = q_pos;
-    let mut best_s_end = s_pos;
+    let mut best_q_end = ext_q;
+    let mut best_s_end = ext_s;
     while qi < qlen && si < slen {
         score += score_profile[qi][subject[si] as usize];
         if score > best {
@@ -648,11 +675,7 @@ fn ungapped_extend_inline(
         si += 1;
     }
 
-    let center = if q_pos < qlen && s_pos < slen {
-        score_profile[q_pos][subject[s_pos] as usize]
-    } else { 0 };
-
-    (left_score + center + best, best_q_start, best_q_end, best_s_start, best_s_end)
+    (left_score + best, best_q_start, best_q_end, best_s_start, best_s_end)
 }
 
 /// Optimized protein search for one subject (legacy, used by search_one_protein_fast).
@@ -933,8 +956,20 @@ fn search_one_protein(
     let diag_len = query.len() + slen + 1;
     let mut ungapped_hits = Vec::new();
 
+    // Match NCBI: compute gap_trigger using UNGAPPED KA params, capped at max self-score
+    let (ug_lam, ug_k) = ungapped_ka_params(params.matrix);
+    let gap_trigger_bits = 22.0f64;
+    let gap_trigger = ((gap_trigger_bits * std::f64::consts::LN_2 + ug_k.ln()) / ug_lam) as i32;
+    let max_self_score: i32 = query.iter()
+        .map(|&q| matrix.scores[q as usize % 28][q as usize % 28])
+        .sum();
+    let cutoff = if params.ungapped_cutoff > 0 {
+        params.ungapped_cutoff
+    } else {
+        gap_trigger.max(1).min(max_self_score)
+    };
+
     if params.two_hit {
-        // 2-hit mode: require two hits on the same diagonal within a window
         let mut diag_last: Vec<i32> = vec![i32::MIN; diag_len];
         let mut diag_extended: Vec<bool> = vec![false; diag_len];
 
@@ -960,9 +995,7 @@ fn search_one_protein(
                         continue;
                     }
 
-                    // 2nd hit within window -> extend
                     let hit = ungapped_extend(query, subject, q_pos, s_pos, matrix, params.x_drop_ungapped);
-                    let cutoff = params.ungapped_cutoff.max(1);
                     if hit.score >= cutoff {
                         diag_extended[diag] = true;
                         ungapped_hits.push(hit);
@@ -985,7 +1018,6 @@ fn search_one_protein(
                     }
 
                     let hit = ungapped_extend(query, subject, q_pos, s_pos, matrix, params.x_drop_ungapped);
-                    let cutoff = params.ungapped_cutoff.max(1);
                     if hit.score >= cutoff {
                         if diag < diag_hit.len() {
                             diag_hit[diag] = true;
@@ -1016,23 +1048,21 @@ fn search_one_protein(
 
         let center_s = (uh.s_start + uh.s_end) / 2;
 
-        // Stage 1: quick score-only check with preliminary X-drop
+        // Stage 1: quick score-only check (match NCBI: raw score threshold)
         let prelim_score = gapped_extend_score_only(
             query, subject, center_q, center_s, matrix,
             params.gap_open, params.gap_extend, params.x_drop_gapped,
         );
-        if prelim_score <= 0 { continue; }
-        let prelim_evalue = ka.evalue(prelim_score, eff_query_len, eff_db_len);
-        if prelim_evalue > params.evalue_threshold { continue; }
+        if prelim_score < cutoff { continue; }
 
-        // Stage 2: full extension with traceback (using final X-drop for better alignment)
+        // Stage 2: full extension with traceback
         let final_x_drop = params.x_drop_final.max(params.x_drop_gapped);
         let gh = gapped_extend(
             query, subject, center_q, center_s, matrix,
             params.gap_open, params.gap_extend, final_x_drop,
         );
 
-        if gh.score <= 0 { continue; }
+        if gh.score < cutoff { continue; }
 
         let evalue = ka.evalue(gh.score, eff_query_len, eff_db_len);
         if evalue > params.evalue_threshold { continue; }
