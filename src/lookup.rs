@@ -2,32 +2,34 @@
 
 use crate::matrix::ScoringMatrix;
 
-/// NCBI-style backbone cell: stores up to 3 hits inline to avoid
-/// pointer dereference for the common case (single cache line access).
+/// Compact backbone cell: 8 bytes (u32 count + u32 data).
+/// Total backbone = 256KB (fits L2) vs 512KB with 16-byte cells.
+/// For 1 hit (most common case): data = query position (inline).
+/// For >1 hits: data = offset into overflow array.
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub struct BackboneCell {
-    /// Number of hits: 0 = empty, 1-3 = inline, >3 = overflow
+    /// Number of hits: 0 = empty, 1 = inline, >1 = overflow
     pub num_used: u32,
-    /// Inline storage for up to 3 query positions, or overflow cursor
-    pub data: [u32; 3],
+    /// For num_used=1: the query position. For num_used>1: overflow array offset.
+    pub data: u32,
 }
 
 /// Protein lookup table using neighboring words.
 ///
-/// Uses NCBI-style architecture:
-/// - Shift-based indexing (charsize=5) for fast rolling hash
-/// - Backbone cells with up to 3 inline hits (no pointer dereference)
-/// - Overflow array for words with >3 hits
-/// - Presence bitfield for quick empty-cell rejection
+/// Uses a popcount-indexed compact architecture:
+/// - Presence bitfield (~4 KB, L1-resident) for quick empty-code rejection
+/// - Cumulative popcount array (~2 KB, L1-resident) for O(1) index computation
+/// - Compact table: only populated codes stored (~40 KB typical, fits L1/L2)
+/// - All hits in a flat array for sequential access
 pub struct ProteinLookup {
     pub word_size: usize,
     pub charsize: u32,
     pub mask: u32,
     /// Presence bitfield for quick rejection (~4 KB, L1-resident)
     pub presence: Vec<u64>,
-    /// Backbone: one cell per possible word code. Most accesses are single cache line.
+    /// Backbone: one cell per possible word code.
     pub backbone: Vec<BackboneCell>,
-    /// Overflow array for words with >3 hits
     pub overflow: Vec<u32>,
     #[allow(dead_code)]
     capacity: usize,
@@ -44,8 +46,8 @@ pub fn encode_protein_word(residues: &[u8]) -> u32 {
     code
 }
 
-/// Constant: max hits stored inline per backbone cell (matches NCBI AA_HITS_PER_CELL)
-const HITS_PER_CELL: usize = 3;
+/// Max hits stored inline per backbone cell (1 = compact 8-byte cells)
+const HITS_PER_CELL: usize = 1;
 
 impl ProteinLookup {
     /// Build lookup table from query (Ncbistdaa encoded).
@@ -55,7 +57,7 @@ impl ProteinLookup {
         let mask = (capacity - 1) as u32;
         let qlen = query.len();
 
-        let empty_cell = BackboneCell { num_used: 0, data: [0; 3] };
+        let empty_cell = BackboneCell { num_used: 0, data: 0 };
 
         if qlen < word_size {
             return ProteinLookup {
@@ -67,36 +69,53 @@ impl ProteinLookup {
             };
         }
 
-        // Phase 1: collect hits into temporary Vecs
-        let mut tmp = vec![Vec::new(); capacity];
+        // Two-pass flat array approach: avoids 32768 Vec allocations.
+        // Pass 1: count hits per word code
+        let mut counts: Vec<u32> = vec![0u32; capacity];
         for q_pos in 0..=(qlen - word_size) {
             let query_word = &query[q_pos..q_pos + word_size];
             enumerate_neighbors_shift(query_word, word_size, charsize, matrix, threshold, &mut |code| {
-                tmp[code as usize].push(q_pos as u32);
+                counts[code as usize] += 1;
             });
         }
 
-        // Phase 2: pack into backbone + overflow (NCBI style)
+        // Compute offsets into flat data array
+        let total_hits: usize = counts.iter().map(|&c| c as usize).sum();
+        let mut offsets: Vec<u32> = vec![0u32; capacity + 1];
+        for i in 0..capacity {
+            offsets[i + 1] = offsets[i] + counts[i];
+        }
+
+        // Pass 2: fill flat data array
+        let mut flat_data: Vec<u32> = vec![0u32; total_hits];
+        let mut cursors = offsets[..capacity].to_vec(); // current write position per code
+        for q_pos in 0..=(qlen - word_size) {
+            let query_word = &query[q_pos..q_pos + word_size];
+            enumerate_neighbors_shift(query_word, word_size, charsize, matrix, threshold, &mut |code| {
+                let idx = cursors[code as usize] as usize;
+                flat_data[idx] = q_pos as u32;
+                cursors[code as usize] += 1;
+            });
+        }
+
+        // Pack into backbone + overflow (NCBI style)
         let mut presence = vec![0u64; capacity.div_ceil(64)];
         let mut backbone = vec![empty_cell; capacity];
         let mut overflow = Vec::new();
 
         for code in 0..capacity {
-            let hits = &tmp[code];
-            if hits.is_empty() { continue; }
+            let n = counts[code] as usize;
+            if n == 0 { continue; }
 
             presence[code / 64] |= 1u64 << (code % 64);
-            let n = hits.len();
-            backbone[code].num_used = n as u32;
+            let start = offsets[code] as usize;
+            let hits = &flat_data[start..start + n];
 
+            backbone[code].num_used = n as u32;
             if n <= HITS_PER_CELL {
-                // Store inline — no pointer dereference needed at lookup time
-                for (i, &pos) in hits.iter().enumerate() {
-                    backbone[code].data[i] = pos;
-                }
+                backbone[code].data = hits[0];
             } else {
-                // Overflow: store cursor into overflow array
-                backbone[code].data[0] = overflow.len() as u32;
+                backbone[code].data = overflow.len() as u32;
                 overflow.extend_from_slice(hits);
             }
         }
@@ -105,12 +124,11 @@ impl ProteinLookup {
     }
 
     /// Get hits for a word code. Inlined for the hot scanning loop.
-    /// For ≤3 hits (common case): returns pointer into the backbone cell (single cache line).
-    /// For >3 hits: returns slice into overflow array.
-    #[inline]
+    /// For 1 hit: returns pointer to inline data (same cache line).
+    /// For >1 hits: returns slice into overflow array.
+    #[inline(always)]
     pub fn get_hits(&self, code: u32) -> &[u32] {
         let code = code as usize;
-        // Quick presence check (L1 cache — 4 KB bitfield)
         let word = code >> 6;
         let bit = code & 63;
         if unsafe { *self.presence.get_unchecked(word) } & (1u64 << bit) == 0 {
@@ -119,11 +137,9 @@ impl ProteinLookup {
         let cell = unsafe { self.backbone.get_unchecked(code) };
         let n = cell.num_used as usize;
         if n <= HITS_PER_CELL {
-            // Inline hits — same cache line as num_used, no pointer chase
-            unsafe { cell.data.get_unchecked(..n) }
+            unsafe { std::slice::from_raw_parts(&cell.data, n) }
         } else {
-            // Overflow
-            let start = cell.data[0] as usize;
+            let start = cell.data as usize;
             unsafe { self.overflow.get_unchecked(start..start + n) }
         }
     }
@@ -137,6 +153,7 @@ impl ProteinLookup {
 }
 
 /// Enumerate neighbors using shift-based (charsize=5) encoding.
+/// Uses stack-allocated arrays (max word_size=7) to avoid per-word heap allocation.
 fn enumerate_neighbors_shift(
     query_word: &[u8],
     word_size: usize,
@@ -145,20 +162,21 @@ fn enumerate_neighbors_shift(
     threshold: i32,
     callback: &mut impl FnMut(u32),
 ) {
-    let mut max_suffix = vec![0i32; word_size + 1];
+    debug_assert!(word_size <= 7, "word_size must be <= 7 for stack arrays");
+    let mut max_suffix = [0i32; 8]; // word_size + 1, max 8
     for i in (0..word_size).rev() {
         let q = query_word[i];
-        let best = (0u8..28).map(|r| matrix.score(q, r)).max().unwrap_or(0);
+        let best = (0u8..28).map(|r| unsafe { matrix.score_unchecked(q, r) }).max().unwrap_or(0);
         max_suffix[i] = max_suffix[i + 1] + best;
     }
-    let mut score_rows = vec![[0i32; 28]; word_size];
-    for (i, row) in score_rows.iter_mut().enumerate() {
+    let mut score_rows = [[0i32; 28]; 7]; // max word_size=7
+    for i in 0..word_size {
         let q = query_word[i];
         for r in 0u8..28 {
-            row[r as usize] = matrix.score(q, r);
+            score_rows[i][r as usize] = unsafe { matrix.score_unchecked(q, r) };
         }
     }
-    enumerate_rec_shift(&score_rows, &max_suffix, word_size, charsize, threshold, 0, 0, 0, callback);
+    enumerate_rec_shift(&score_rows[..word_size], &max_suffix[..word_size + 1], word_size, charsize, threshold, 0, 0, 0, callback);
 }
 
 /// Recursive neighbor enumeration with shift-based encoding.
@@ -267,12 +285,17 @@ impl NucleotideLookup {
     /// Scan subject sequence for hits against this lookup table.
     /// Returns iterator of (query_pos, subject_pos) hits.
     pub fn scan_subject<'a>(&'a self, subject: &'a [u8]) -> impl Iterator<Item = (u32, u32)> + 'a {
+        let encoded: Vec<u8> = subject.iter().map(|&b| crate::matrix::nt_to_2bit(b)).collect();
+        self.scan_subject_encoded(&encoded).into_iter()
+    }
+
+    /// Scan pre-encoded (2-bit) subject for hits. Avoids re-encoding per call.
+    pub fn scan_subject_encoded(&self, encoded: &[u8]) -> Vec<(u32, u32)> {
         let mask = (self.capacity - 1) as u32;
         let ws = self.word_size;
-        let encoded: Vec<u8> = subject.iter().map(|&b| crate::matrix::nt_to_2bit(b)).collect();
 
         let mut hits = Vec::new();
-        if encoded.len() < ws { return hits.into_iter(); }
+        if encoded.len() < ws { return hits; }
 
         let mut word_code: u32 = 0;
         let mut valid = true;
@@ -310,7 +333,7 @@ impl NucleotideLookup {
                 hits.push((q_pos, s_pos));
             }
         }
-        hits.into_iter()
+        hits
     }
 }
 
@@ -391,6 +414,11 @@ impl DiscontiguousLookup {
 
     pub fn scan_subject<'a>(&'a self, subject: &'a [u8]) -> Vec<(u32, u32)> {
         let encoded: Vec<u8> = subject.iter().map(|&b| crate::matrix::nt_to_2bit(b)).collect();
+        self.scan_subject_encoded(&encoded)
+    }
+
+    /// Scan pre-encoded (2-bit) subject for hits. Avoids re-encoding per call.
+    pub fn scan_subject_encoded(&self, encoded: &[u8]) -> Vec<(u32, u32)> {
         let mut hits = Vec::new();
 
         if encoded.len() < self.template_length { return hits; }

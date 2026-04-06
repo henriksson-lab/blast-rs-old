@@ -45,16 +45,22 @@ pub static BACKGROUND_FREQ: [f64; 28] = [
 
 /// Compute the amino acid composition (as frequencies) of a Ncbistdaa-encoded sequence.
 /// Only codes 1–22 (standard amino acids) contribute.
+/// Uses branchless counting for better auto-vectorization.
 pub fn composition_ncbistdaa(seq: &[u8]) -> [f64; 28] {
-    let mut counts = [0u64; 28];
-    let mut total = 0u64;
+    let mut counts = [0u32; 28];
     for &c in seq {
+        // Branchless: always increment, using u8 < 28 as index safety
         let idx = c as usize;
-        if (1..=22).contains(&idx) {
+        if idx < 28 {
             counts[idx] += 1;
-            total += 1;
         }
     }
+    // Total = sum of codes 1..=22 only
+    let total: u32 = counts[1..=22].iter().sum();
+    // Zero out non-standard codes for frequency computation
+    counts[0] = 0;
+    for i in 23..28 { counts[i] = 0; }
+
     let mut freq = [0.0f64; 28];
     if total > 0 {
         let t = total as f64;

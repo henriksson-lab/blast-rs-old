@@ -7,10 +7,18 @@ use crate::db::BlastDb;
 use crate::matrix::{ScoringMatrix, MatrixType, nt_to_2bit};
 use crate::stats::{KarlinAltschul, GapPenalty, lookup_ka_params, blastn_ka_params};
 use crate::lookup::{ProteinLookup, NucleotideLookup, DiscontiguousLookup};
-use crate::extend::{ungapped_extend, gapped_extend, gapped_extend_score_only, ungapped_extend_nucleotide};
+use crate::extend::{ungapped_extend, gapped_extend, gapped_extend_score_only_with_scratch, GappedScratch, ungapped_extend_nucleotide};
 use crate::hsp::{Hsp, SearchResult};
 use crate::translate::{six_frame_translate_with_code, strip_stops, TranslatedFrame, reverse_complement};
 use crate::compo::{composition_ncbistdaa, adjust_evalue_with_mode};
+
+use std::cell::RefCell;
+
+// Module-level thread-local scratch for score-only gapped extension.
+// Shared by search_one_protein_fast and search_one_protein (never concurrent).
+thread_local! {
+    static GAPPED_EXT_SCRATCH: RefCell<GappedScratch> = RefCell::new(GappedScratch::new());
+}
 
 /// Parameters for a BLAST search.
 ///
@@ -279,8 +287,18 @@ pub fn blast_search(
     let query_comp = if params.comp_adjust > 0 { Some(composition_ncbistdaa(query_for_extend)) } else { None };
     let comp_mode = params.comp_adjust;
 
-    // Precompute query score profile for fast ungapped extension:
-    // profile[q_residue][s_residue] = score, accessed as profile[query[i]][subject[j]]
+    // Compact i8 score profile for cache-efficient ungapped extension.
+    // BLOSUM62 scores range -4..+11, all fit in i8. Padding to 32 bytes
+    // aligns rows to half a cache line (32B), so 2 rows per 64B cache line.
+    // For 1000aa query: 32KB (fits L1) vs 112KB with i32 profile.
+    let score_profile_i8: Vec<[i8; 32]> = query_for_extend.iter().map(|&q| {
+        let mut row = [0i8; 32];
+        for r in 0..28u8 {
+            row[r as usize] = matrix.scores[q as usize % 28][r as usize] as i8;
+        }
+        row
+    }).collect();
+    // Keep i32 profile for gapped extension (which needs wider accumulators)
     let score_profile: Vec<[i32; 28]> = query_for_extend.iter().map(|&q| {
         let mut row = [0i32; 28];
         for r in 0..28u8 {
@@ -291,7 +309,6 @@ pub fn blast_search(
 
     // Process each OID (parallelized with rayon)
     // Thread-local scratch buffers avoid per-subject allocation
-    use std::cell::RefCell;
     thread_local! {
         static SCRATCH: RefCell<SearchScratch> = RefCell::new(SearchScratch::new());
     }
@@ -312,10 +329,12 @@ pub fn blast_search(
             }
             search_one_protein_scratch(
                 query_for_extend, subject, &lookup, &matrix, &ka, params,
-                eff_query_len, eff_db_len, &score_profile, &mut scratch,
+                eff_query_len, eff_db_len, &score_profile, &score_profile_i8, &mut scratch,
                 effective_cutoff, capped_trigger,
             )
         });
+
+        if hsps.is_empty() { return None; }
 
         // Composition adjustment (mode 0=off, 1=unconditional, 2=conditional, 3=forced)
         if let Some(ref qc) = query_comp {
@@ -388,6 +407,8 @@ struct SearchScratch {
     diag_offset: i32,
     ungapped_hits: Vec<(i32, usize, usize, usize, usize)>,
     covered_query: Vec<bool>,
+    /// Reusable buffers for score-only gapped extension (avoids per-HSP allocations).
+    gapped_scratch: GappedScratch,
 }
 
 impl SearchScratch {
@@ -398,6 +419,7 @@ impl SearchScratch {
             diag_offset: 0,
             ungapped_hits: Vec::new(),
             covered_query: Vec::new(),
+            gapped_scratch: GappedScratch::new(),
         }
     }
 
@@ -445,7 +467,8 @@ fn search_one_protein_scratch(
     params: &SearchParams,
     eff_query_len: usize,
     eff_db_len: u64,
-    score_profile: &[[i32; 28]],
+    _score_profile: &[[i32; 28]],
+    score_profile_i8: &[[i8; 32]],
     scratch: &mut SearchScratch,
     ungapped_cutoff: i32,
     gap_trigger: i32,
@@ -469,15 +492,15 @@ fn search_one_protein_scratch(
     // Separate functions keep instruction footprint small for icache.
     if params.two_hit {
         scan_two_hit(
-            subject, lookup, score_profile, x_drop, cutoff,
-            charsize, mask, ws, diag_mask, diag_offset, window,
+            subject, lookup, score_profile_i8, x_drop, cutoff,
+            diag_mask, diag_offset, window,
             &mut scratch.diag_array, &mut scratch.ungapped_hits,
             query,
         );
     } else {
         scan_one_hit(
-            subject, lookup, score_profile, x_drop, cutoff,
-            charsize, mask, ws, diag_mask, diag_offset,
+            subject, lookup, score_profile_i8, x_drop, cutoff,
+            diag_mask, diag_offset,
             &mut scratch.diag_array, &mut scratch.ungapped_hits,
             query,
         );
@@ -503,9 +526,10 @@ fn search_one_protein_scratch(
         // filtered at save time.
 
         // Stage 1: preliminary score-only extension (fast rejection)
-        let prelim_score = gapped_extend_score_only(
+        let prelim_score = gapped_extend_score_only_with_scratch(
             query, subject, center_q, center_s, matrix,
             params.gap_open, params.gap_extend, params.x_drop_gapped,
+            &mut scratch.gapped_scratch,
         );
         // Match NCBI: check raw score against gap_trigger (same as ungapped cutoff)
         if prelim_score < gap_trigger { continue; }
@@ -554,19 +578,82 @@ fn search_one_protein_scratch(
     hsps
 }
 
-/// Two-hit scanning: faithful port of NCBI's s_BlastAaWordFinder_TwoHit.
-/// Kept as a separate function for icache efficiency.
+/// Process hits for a single word code that passed the presence check.
+/// Separated from the scan loop to reduce instruction footprint of the fast path (no-hit).
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn process_two_hit_word(
+    bb_ptr: *const crate::lookup::BackboneCell,
+    ovfl_ptr: *const u32,
+    code: u32,
+    s_pos: usize,
+    diag_offset: i32,
+    diag_mask: usize,
+    window: i32,
+    ws_i32: i32,
+    diag_arr: *mut DiagEntry,
+    prof_ptr: *const [i8; 32],
+    x_drop: i32,
+    cutoff: i32,
+    query: &[u8],
+    subject: &[u8],
+    ungapped_hits: &mut Vec<(i32, usize, usize, usize, usize)>,
+) {
+    let cell = &*bb_ptr.add(code as usize);
+    let n = cell.num_used as usize;
+
+    let (hits_ptr, hits_len) = if n <= 1 {
+        (&cell.data as *const u32, n)
+    } else {
+        (ovfl_ptr.add(cell.data as usize), n)
+    };
+
+    let s_off_i32 = s_pos as i32;
+    let s_with_offset = s_off_i32 + diag_offset;
+
+    for h in 0..hits_len {
+        let q_pos = *hits_ptr.add(h) as usize;
+        let diag_coord = q_pos.wrapping_sub(s_pos) & diag_mask;
+        let dc = diag_arr.add(diag_coord);
+        let entry = *dc;
+
+        if entry.flag() {
+            if s_with_offset < entry.last_hit() { continue; }
+            *dc = DiagEntry::new(s_with_offset, false);
+            continue;
+        }
+
+        let diff = s_off_i32 - (entry.last_hit() - diag_offset);
+
+        if (diff as u32) >= (window as u32) {
+            *dc = DiagEntry::new(s_with_offset, false);
+            continue;
+        }
+
+        if diff < ws_i32 { continue; }
+
+        let hit = ungapped_extend_unsafe(
+            query, subject, q_pos, s_pos, prof_ptr, x_drop,
+        );
+        if hit.0 >= cutoff {
+            ungapped_hits.push(hit);
+            *dc = DiagEntry::new(hit.4 as i32 + diag_offset, true);
+        } else {
+            *dc = DiagEntry::new(s_with_offset, false);
+        }
+    }
+}
+
+/// Two-hit scanning with interleaved scan+process.
+/// Parameter count minimized to reduce register pressure (fewer stack spills).
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn scan_two_hit(
     subject: &[u8],
     lookup: &crate::lookup::ProteinLookup,
-    score_profile: &[[i32; 28]],
+    score_profile: &[[i8; 32]],
     x_drop: i32,
     cutoff: i32,
-    charsize: u32,
-    mask: u32,
-    ws: usize,
     diag_mask: usize,
     diag_offset: i32,
     window: i32,
@@ -575,6 +662,9 @@ fn scan_two_hit(
     query: &[u8],
 ) {
     let slen = subject.len();
+    let ws = lookup.word_size;
+    let charsize = lookup.charsize;
+    let mask = lookup.mask;
     let num_words = slen - ws + 1;
     let ws_i32 = ws as i32;
 
@@ -591,66 +681,19 @@ fn scan_two_hit(
             code = (code << charsize) | (*subj_ptr.add(i) as u32 & 0x1F);
         }
 
-        for s_pos in 0..num_words {
-            if s_pos > 0 {
-                code = ((code << charsize) | (*subj_ptr.add(s_pos + ws - 1) as u32 & 0x1F)) & mask;
-            }
-
+        let mut s_pos = 0usize;
+        loop {
             let pv_word = *pv_ptr.add((code as usize) >> 6);
-            if pv_word & (1u64 << (code & 63)) == 0 { continue; }
-
-            let cell = &*bb_ptr.add(code as usize);
-            let n = cell.num_used as usize;
-            if n == 0 { continue; }
-
-            let (hits_ptr, hits_len) = if n <= 3 {
-                (cell.data.as_ptr(), n)
-            } else {
-                (ovfl_ptr.add(cell.data[0] as usize), n)
-            };
-
-            let s_off_i32 = s_pos as i32;
-            let s_with_offset = s_off_i32 + diag_offset;
-
-            // NCBI-style hit processing: minimize branches using combined conditions.
-            // The flag+last_hit are packed in a single u32, enabling branchless comparisons.
-            for h in 0..hits_len {
-                let q_pos = *hits_ptr.add(h) as usize;
-                let diag_coord = q_pos.wrapping_sub(s_pos) & diag_mask;
-                let dc = diag_arr.add(diag_coord);
-                let entry = *dc;
-
-                // Combined check: if flag is set and we haven't passed the last_hit, skip.
-                // If flag is set but we HAVE passed, start new hit.
-                if entry.flag() {
-                    if s_with_offset < entry.last_hit() { continue; }
-                    *dc = DiagEntry::new(s_with_offset, false);
-                    continue;
-                }
-
-                // Not flagged: check two-hit window
-                let diff = s_off_i32 - (entry.last_hit() - diag_offset);
-
-                // Record new hit if outside window or first hit on diagonal
-                if (diff as u32) >= (window as u32) {
-                    // Covers diff >= window AND diff < 0 (negative wraps to large u32)
-                    *dc = DiagEntry::new(s_with_offset, false);
-                    continue;
-                }
-
-                if diff < ws_i32 { continue; }
-
-                // Two hits within window — extend
-                let hit = ungapped_extend_unsafe(
-                    query, subject, q_pos, s_pos, prof_ptr, x_drop,
+            if pv_word & (1u64 << (code & 63)) != 0 {
+                process_two_hit_word(
+                    bb_ptr, ovfl_ptr, code, s_pos, diag_offset, diag_mask, window, ws_i32,
+                    diag_arr, prof_ptr, x_drop, cutoff, query, subject, ungapped_hits,
                 );
-                if hit.0 >= cutoff {
-                    ungapped_hits.push(hit);
-                    *dc = DiagEntry::new(hit.4 as i32 + diag_offset, true);
-                } else {
-                    *dc = DiagEntry::new(s_with_offset, false);
-                }
             }
+
+            s_pos += 1;
+            if s_pos >= num_words { break; }
+            code = ((code << charsize) | (*subj_ptr.add(s_pos + ws - 1) as u32 & 0x1F)) & mask;
         }
     }
 }
@@ -661,12 +704,9 @@ fn scan_two_hit(
 fn scan_one_hit(
     subject: &[u8],
     lookup: &crate::lookup::ProteinLookup,
-    score_profile: &[[i32; 28]],
+    score_profile: &[[i8; 32]],
     x_drop: i32,
     cutoff: i32,
-    charsize: u32,
-    mask: u32,
-    ws: usize,
     diag_mask: usize,
     diag_offset: i32,
     diag_array: &mut [DiagEntry],
@@ -674,6 +714,9 @@ fn scan_one_hit(
     query: &[u8],
 ) {
     let slen = subject.len();
+    let ws = lookup.word_size;
+    let charsize = lookup.charsize;
+    let mask = lookup.mask;
     let num_words = slen - ws + 1;
 
     unsafe {
@@ -689,22 +732,19 @@ fn scan_one_hit(
             code = (code << charsize) | (*subj_ptr.add(i) as u32 & 0x1F);
         }
 
-        for s_pos in 0..num_words {
-            if s_pos > 0 {
-                code = ((code << charsize) | (*subj_ptr.add(s_pos + ws - 1) as u32 & 0x1F)) & mask;
-            }
-
+        let mut s_pos = 0usize;
+        loop {
             let pv_word = *pv_ptr.add((code as usize) >> 6);
-            if pv_word & (1u64 << (code & 63)) == 0 { continue; }
+            if pv_word & (1u64 << (code & 63)) != 0 {
 
             let cell = &*bb_ptr.add(code as usize);
             let n = cell.num_used as usize;
-            if n == 0 { continue; }
+            // n > 0 guaranteed by presence bit
 
-            let (hits_ptr, hits_len) = if n <= 3 {
-                (cell.data.as_ptr(), n)
+            let (hits_ptr, hits_len) = if n <= 1 {
+                (&cell.data as *const u32, n)
             } else {
-                (ovfl_ptr.add(cell.data[0] as usize), n)
+                (ovfl_ptr.add(cell.data as usize), n)
             };
 
             let s_with_offset = s_pos as i32 + diag_offset;
@@ -724,16 +764,22 @@ fn scan_one_hit(
                     ungapped_hits.push(hit);
                 }
             }
+
+            } // pv check
+
+            s_pos += 1;
+            if s_pos >= num_words { break; }
+            code = ((code << charsize) | (*subj_ptr.add(s_pos + ws - 1) as u32 & 0x1F)) & mask;
         }
     }
 }
 
-/// Raw pointer ungapped extension — faithful port of NCBI's s_BlastAaExtendRight/Left.
+/// Raw pointer ungapped extension using compact i8 profile for cache efficiency.
 /// All bounds are pre-validated by the caller; inner loops use pure pointer arithmetic.
 #[inline(always)]
 unsafe fn ungapped_extend_unsafe(
     query: &[u8], subject: &[u8], q_pos: usize, s_pos: usize,
-    prof_ptr: *const [i32; 28], x_drop: i32,
+    prof_ptr: *const [i8; 32], x_drop: i32,
 ) -> (i32, usize, usize, usize, usize) {
     let qlen = query.len();
     let slen = subject.len();
@@ -745,9 +791,12 @@ unsafe fn ungapped_extend_unsafe(
     let mut scan_score = 0i32;
     let mut best_scan = 0i32;
     let mut right_d = 0usize;
+    let mut q_scan = prof_ptr.add(q_pos);
+    let mut s_scan = s_ptr.add(s_pos);
     for i in 0..scan_end {
-        let row = &*prof_ptr.add(q_pos + i);
-        scan_score += row[*s_ptr.add(s_pos + i) as usize];
+        scan_score += (*q_scan)[*s_scan as usize] as i32;
+        q_scan = q_scan.add(1);
+        s_scan = s_scan.add(1);
         if scan_score > best_scan {
             best_scan = scan_score;
             right_d = i + 1;
@@ -757,14 +806,17 @@ unsafe fn ungapped_extend_unsafe(
     let eq = q_pos + right_d;
     let es = s_pos + right_d;
 
-    // Extend left (NCBI s_BlastAaExtendLeft)
+    // Extend left
     let n_left = eq.min(es);
     let mut score = 0i32;
     let mut maxscore = 0i32;
     let mut best_left = 0usize;
+    let mut q_left = prof_ptr.add(eq);
+    let mut s_left = s_ptr.add(es);
     for i in 1..=n_left {
-        let row = &*prof_ptr.add(eq - i);
-        score += row[*s_ptr.add(es - i) as usize];
+        q_left = q_left.sub(1);
+        s_left = s_left.sub(1);
+        score += (*q_left)[*s_left as usize] as i32;
         if score > maxscore {
             maxscore = score;
             best_left = i;
@@ -773,14 +825,17 @@ unsafe fn ungapped_extend_unsafe(
     }
     let left_score = maxscore;
 
-    // Extend right (NCBI s_BlastAaExtendRight)
+    // Extend right
     let n_right = (qlen - eq).min(slen - es);
     score = 0;
     maxscore = 0;
     let mut best_right = 0usize;
+    let mut q_right = prof_ptr.add(eq);
+    let mut s_right = s_ptr.add(es);
     for i in 0..n_right {
-        let row = &*prof_ptr.add(eq + i);
-        score += row[*s_ptr.add(es + i) as usize];
+        score += (*q_right)[*s_right as usize] as i32;
+        q_right = q_right.add(1);
+        s_right = s_right.add(1);
         if score > maxscore {
             maxscore = score;
             best_right = i + 1;
@@ -1061,10 +1116,14 @@ fn search_one_protein_fast(
         let center_s = (ss + se) / 2;
 
         // Stage 1: score-only preliminary check
-        let prelim_score = gapped_extend_score_only(
-            query, subject, center_q, center_s, matrix,
-            params.gap_open, params.gap_extend, params.x_drop_gapped,
-        );
+        let prelim_score = GAPPED_EXT_SCRATCH.with(|gs| {
+            let mut gs = gs.borrow_mut();
+            gapped_extend_score_only_with_scratch(
+                query, subject, center_q, center_s, matrix,
+                params.gap_open, params.gap_extend, params.x_drop_gapped,
+                &mut gs,
+            )
+        });
         if prelim_score <= 0 { continue; }
         let prelim_evalue = ka.evalue(prelim_score, eff_query_len, eff_db_len);
         if prelim_evalue > params.evalue_threshold { continue; }
@@ -1242,10 +1301,14 @@ fn search_one_protein(
         let center_s = uh.s_seed;
 
         // Stage 1: quick score-only check (match NCBI: raw score threshold)
-        let prelim_score = gapped_extend_score_only(
-            query, subject, center_q, center_s, matrix,
-            params.gap_open, params.gap_extend, params.x_drop_gapped,
-        );
+        let prelim_score = GAPPED_EXT_SCRATCH.with(|gs| {
+            let mut gs = gs.borrow_mut();
+            gapped_extend_score_only_with_scratch(
+                query, subject, center_q, center_s, matrix,
+                params.gap_open, params.gap_extend, params.x_drop_gapped,
+                &mut gs,
+            )
+        });
         if prelim_score < cutoff { continue; }
 
         // Stage 2: full extension with traceback
@@ -1331,6 +1394,9 @@ pub fn blastn_search(
 
     for (q_seq, q_frame) in &queries_to_search {
         let lookup = NucleotideLookup::build(q_seq, params.word_size);
+        // Pre-compute query-dependent data once per strand (not per subject)
+        let nt_matrix = build_nt_matrix(params.match_score, params.mismatch);
+        let query_2bit: Vec<u8> = q_seq.iter().map(|&b| nt_to_2bit(b)).collect();
 
         let oids: Vec<u32> = (0..db.num_sequences()).collect();
 
@@ -1349,6 +1415,8 @@ pub fn blastn_search(
                 params,
                 eff_query_len,
                 eff_db_len,
+                &nt_matrix,
+                &query_2bit,
             );
 
             // Set query_frame on HSPs so output can distinguish strands
@@ -1395,6 +1463,7 @@ pub fn blastn_search(
     results
 }
 
+#[allow(clippy::too_many_arguments)]
 fn search_one_nucleotide(
     query: &[u8],
     subject: &[u8],
@@ -1403,17 +1472,22 @@ fn search_one_nucleotide(
     params: &SearchParams,
     eff_query_len: usize,
     eff_db_len: u64,
+    nt_matrix: &ScoringMatrix,
+    query_2bit: &[u8],
 ) -> Vec<Hsp> {
     let diag_offset = query.len();
     let diag_len = query.len() + subject.len() + 1;
     let mut ungapped_hits = Vec::new();
+
+    // Pre-encode subject once (avoids re-encoding per scan_subject call)
+    let subject_encoded: Vec<u8> = subject.iter().map(|&b| nt_to_2bit(b)).collect();
 
     if params.two_hit {
         // 2-hit mode for nucleotide
         let mut diag_last: Vec<i32> = vec![i32::MIN; diag_len];
         let mut diag_extended: Vec<bool> = vec![false; diag_len];
 
-        for (q_pos, s_pos) in lookup.scan_subject(subject) {
+        for (q_pos, s_pos) in lookup.scan_subject_encoded(&subject_encoded) {
             let q_pos = q_pos as usize;
             let s_pos = s_pos as usize;
             let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
@@ -1448,7 +1522,7 @@ fn search_one_nucleotide(
         // Single-hit mode (original behavior)
         let mut diag_hit: Vec<bool> = vec![false; diag_len];
 
-        for (q_pos, s_pos) in lookup.scan_subject(subject) {
+        for (q_pos, s_pos) in lookup.scan_subject_encoded(&subject_encoded) {
             let q_pos = q_pos as usize;
             let s_pos = s_pos as usize;
             let diag = (s_pos as isize - q_pos as isize + diag_offset as isize) as usize;
@@ -1470,11 +1544,8 @@ fn search_one_nucleotide(
     if ungapped_hits.is_empty() { return vec![]; }
     ungapped_hits.sort_by(|a, b| b.score.cmp(&a.score));
 
-    // Gapped extension with nucleotide scoring
-    // Convert query/subject to 2-bit encoding for the scoring matrix (indices 0-3)
-    let nt_matrix = build_nt_matrix(params.match_score, params.mismatch);
-    let query_2bit: Vec<u8> = query.iter().map(|&b| nt_to_2bit(b)).collect();
-    let subject_2bit: Vec<u8> = subject.iter().map(|&b| nt_to_2bit(b)).collect();
+    // Gapped extension with nucleotide scoring (query_2bit and nt_matrix pre-computed by caller)
+    let subject_2bit = subject_encoded;
     let mut hsps = Vec::new();
     let mut covered: Vec<bool> = vec![false; query.len()];
 
@@ -1852,6 +1923,10 @@ pub fn dc_megablast_search(
 
     let dc_lookup = DiscontiguousLookup::build(query, template_type, template_length);
 
+    // Pre-compute query-dependent data once (not per subject)
+    let nt_matrix = build_nt_matrix(params.match_score, params.mismatch);
+    let query_2bit: Vec<u8> = query.iter().map(|&b| nt_to_2bit(b)).collect();
+
     let oids: Vec<u32> = (0..db.num_sequences()).collect();
 
     let mut results: Vec<SearchResult> = oids.par_iter().filter_map(|&oid| {
@@ -1861,12 +1936,9 @@ pub fn dc_megablast_search(
         };
         if subject.is_empty() { return None; }
 
-        let seed_hits = dc_lookup.scan_subject(&subject);
-        if seed_hits.is_empty() { return None; }
-
-        let nt_matrix = build_nt_matrix(params.match_score, params.mismatch);
-        let query_2bit: Vec<u8> = query.iter().map(|&b| nt_to_2bit(b)).collect();
         let subject_2bit: Vec<u8> = subject.iter().map(|&b| nt_to_2bit(b)).collect();
+        let seed_hits = dc_lookup.scan_subject_encoded(&subject_2bit);
+        if seed_hits.is_empty() { return None; }
         let mut hsps = Vec::new();
         let diag_offset = query.len();
         let mut diag_hit = vec![false; query.len() + subject.len() + 1];

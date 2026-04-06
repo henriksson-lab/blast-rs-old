@@ -390,26 +390,17 @@ pub fn gapped_extend(
     gap_extend: i32,
     x_drop: i32,
 ) -> GappedHit {
-    // Extend right
+    // Extend right (forward)
     let right = extend_one_direction(
         &query[q_center..],
         &subject[s_center..],
-        matrix,
-        gap_open,
-        gap_extend,
-        x_drop,
+        matrix, gap_open, gap_extend, x_drop,
     );
 
-    // Extend left (reversed)
-    let query_rev: Vec<u8> = query[..q_center].iter().rev().cloned().collect();
-    let subject_rev: Vec<u8> = subject[..s_center].iter().rev().cloned().collect();
-    let left = extend_one_direction(
-        &query_rev,
-        &subject_rev,
-        matrix,
-        gap_open,
-        gap_extend,
-        x_drop,
+    // Extend left: use reverse-indexing wrapper to avoid allocating reversed copies.
+    let left = extend_one_direction_reverse(
+        query, subject, q_center, s_center,
+        matrix, gap_open, gap_extend, x_drop,
     );
 
     // Combine
@@ -419,17 +410,19 @@ pub fn gapped_extend(
     let s_start = s_center - left.subject_len;
     let s_end = s_center + right.subject_len;
 
-    // Build alignment strings
-    let mut query_aln = Vec::new();
-    let mut midline = Vec::new();
-    let mut subject_aln = Vec::new();
-    // Left part (reversed)
-    let mut left_q_aln: Vec<u8> = left.query_aln.iter().rev().cloned().collect();
-    let mut left_m_aln: Vec<u8> = left.midline.iter().rev().cloned().collect();
-    let mut left_s_aln: Vec<u8> = left.subject_aln.iter().rev().cloned().collect();
-    query_aln.append(&mut left_q_aln);
-    midline.append(&mut left_m_aln);
-    subject_aln.append(&mut left_s_aln);
+    // Build alignment: left part is already in correct order from reverse extension
+    let left_aln_len = left.query_aln.len();
+    let right_aln_len = right.query_aln.len();
+    let total_aln_len = left_aln_len + right_aln_len;
+
+    let mut query_aln = Vec::with_capacity(total_aln_len);
+    let mut midline = Vec::with_capacity(total_aln_len);
+    let mut subject_aln = Vec::with_capacity(total_aln_len);
+
+    // Left part (already in forward order from extend_one_direction_reverse)
+    query_aln.extend_from_slice(&left.query_aln);
+    midline.extend_from_slice(&left.midline);
+    subject_aln.extend_from_slice(&left.subject_aln);
 
     // Right part
     query_aln.extend_from_slice(&right.query_aln);
@@ -442,100 +435,53 @@ pub fn gapped_extend(
 
     GappedHit {
         score: total_score,
-        q_start,
-        q_end,
-        s_start,
-        s_end,
-        num_identities,
-        num_gaps,
-        query_aln,
-        midline,
-        subject_aln,
+        q_start, q_end, s_start, s_end,
+        num_identities, num_gaps,
+        query_aln, midline, subject_aln,
     }
 }
+/// Reusable scratch buffers for score-only gapped extension.
+/// Avoids per-call heap allocations in the hot path.
+pub struct GappedScratch {
+    profile: Vec<[i32; 28]>,
+    subj_idx: Vec<usize>,
+    h_prev: Vec<i32>,
+    h_curr: Vec<i32>,
+    e_curr: Vec<i32>,
+    f_prev: Vec<i32>,
+    f_curr: Vec<i32>,
+    diag_scores: Vec<i32>,
+    subject_scores: Vec<i32>,
+}
 
-/// Trim leading and trailing non-identity positions from an alignment.
-///
-/// NCBI BLAST+ trims alignment ends that contain mismatches or gaps,
-/// keeping only the portion bounded by identity positions on both ends.
-/// This prevents positive-scoring mismatches (e.g., BLOSUM62 L/M = +2)
-/// from inflating alignment boundaries beyond the actual matching region.
-#[allow(clippy::too_many_arguments)]
-fn trim_alignment_to_max_score(
-    query_aln: Vec<u8>,
-    midline: Vec<u8>,
-    subject_aln: Vec<u8>,
-    q_start: usize,
-    q_end: usize,
-    s_start: usize,
-    s_end: usize,
-    _matrix: &ScoringMatrix,
-    _gap_open: i32,
-    _gap_extend: i32,
-) -> (Vec<u8>, Vec<u8>, Vec<u8>, usize, usize, usize, usize) {
-    let aln_len = query_aln.len();
-    if aln_len == 0 {
-        return (query_aln, midline, subject_aln, q_start, q_end, s_start, s_end);
-    }
-
-    // Find first identity from left
-    let mut trim_left = 0;
-    for i in 0..aln_len {
-        if midline[i] == b'|' {
-            trim_left = i;
-            break;
+impl GappedScratch {
+    pub fn new() -> Self {
+        GappedScratch {
+            profile: Vec::new(),
+            subj_idx: Vec::new(),
+            h_prev: Vec::new(),
+            h_curr: Vec::new(),
+            e_curr: Vec::new(),
+            f_prev: Vec::new(),
+            f_curr: Vec::new(),
+            diag_scores: Vec::new(),
+            subject_scores: Vec::new(),
         }
     }
 
-    // Find last identity from right
-    let mut trim_right = aln_len;
-    for i in (0..aln_len).rev() {
-        if midline[i] == b'|' {
-            trim_right = i + 1;
-            break;
-        }
+    /// Ensure all DP buffers are large enough for the given dimensions.
+    fn ensure_capacity(&mut self, qlen: usize, slen: usize) {
+        let cols = slen + 1;
+        if self.profile.len() < qlen { self.profile.resize(qlen, [0i32; 28]); }
+        if self.subj_idx.len() < slen { self.subj_idx.resize(slen, 0); }
+        if self.h_prev.len() < cols { self.h_prev.resize(cols, 0); }
+        if self.h_curr.len() < cols { self.h_curr.resize(cols, 0); }
+        if self.e_curr.len() < cols { self.e_curr.resize(cols, 0); }
+        if self.f_prev.len() < cols { self.f_prev.resize(cols, 0); }
+        if self.f_curr.len() < cols { self.f_curr.resize(cols, 0); }
+        if self.diag_scores.len() < cols { self.diag_scores.resize(cols, 0); }
+        if self.subject_scores.len() < slen { self.subject_scores.resize(slen, 0); }
     }
-
-    if trim_left >= trim_right || (trim_left == 0 && trim_right == aln_len) {
-        return (query_aln, midline, subject_aln, q_start, q_end, s_start, s_end);
-    }
-
-    // Count query/subject positions consumed in trimmed prefix/suffix
-    let mut q_trim_left = 0usize;
-    let mut s_trim_left = 0usize;
-    for i in 0..trim_left {
-        if query_aln[i] != b'-' {
-            q_trim_left += 1;
-        }
-        if subject_aln[i] != b'-' {
-            s_trim_left += 1;
-        }
-    }
-    let mut q_trim_right = 0usize;
-    let mut s_trim_right = 0usize;
-    for i in trim_right..aln_len {
-        if query_aln[i] != b'-' {
-            q_trim_right += 1;
-        }
-        if subject_aln[i] != b'-' {
-            s_trim_right += 1;
-        }
-    }
-
-    let new_q_start = q_start + q_trim_left;
-    let new_q_end = q_end - q_trim_right;
-    let new_s_start = s_start + s_trim_left;
-    let new_s_end = s_end - s_trim_right;
-
-    (
-        query_aln[trim_left..trim_right].to_vec(),
-        midline[trim_left..trim_right].to_vec(),
-        subject_aln[trim_left..trim_right].to_vec(),
-        new_q_start,
-        new_q_end,
-        new_s_start,
-        new_s_end,
-    )
 }
 
 /// Score-only gapped extension (no traceback, no alignment strings).
@@ -557,10 +503,6 @@ pub fn gapped_extend_score_only(
     let subject_rev: Vec<u8> = subject[..s_center].iter().rev().cloned().collect();
 
     // Farrar's striped SIMD with segment-level X-drop pruning.
-    // Beneficial when alignments are long relative to query length (wide bands).
-    // For short local alignments against random sequences, the banded scalar approach
-    // is faster because striped layout spreads contiguous query positions across segments,
-    // preventing effective pruning along the query axis.
     #[cfg(target_arch = "x86_64")]
     if has_avx2() && q_right.len() > 2000 && s_right.len() > 2000 {
         let right = unsafe { extend_score_only_striped(q_right, s_right, matrix, gap_open, gap_extend, x_drop) };
@@ -570,6 +512,39 @@ pub fn gapped_extend_score_only(
 
     let right = extend_score_only(q_right, s_right, matrix, gap_open, gap_extend, x_drop);
     let left = extend_score_only(&query_rev, &subject_rev, matrix, gap_open, gap_extend, x_drop);
+    left + right
+}
+
+/// Score-only gapped extension using pre-allocated scratch buffers.
+/// Eliminates per-call heap allocations in the hot path.
+#[allow(clippy::too_many_arguments)]
+pub fn gapped_extend_score_only_with_scratch(
+    query: &[u8],
+    subject: &[u8],
+    q_center: usize,
+    s_center: usize,
+    matrix: &ScoringMatrix,
+    gap_open: i32,
+    gap_extend: i32,
+    x_drop: i32,
+    scratch: &mut GappedScratch,
+) -> i32 {
+    let q_right = &query[q_center..];
+    let s_right = &subject[s_center..];
+
+    // Farrar's striped SIMD for very long alignments (still needs reversed copies)
+    #[cfg(target_arch = "x86_64")]
+    if has_avx2() && q_right.len() > 2000 && s_right.len() > 2000 {
+        let query_rev: Vec<u8> = query[..q_center].iter().rev().cloned().collect();
+        let subject_rev: Vec<u8> = subject[..s_center].iter().rev().cloned().collect();
+        let right = unsafe { extend_score_only_striped(q_right, s_right, matrix, gap_open, gap_extend, x_drop) };
+        let left = unsafe { extend_score_only_striped(&query_rev, &subject_rev, matrix, gap_open, gap_extend, x_drop) };
+        return left.saturating_add(right);
+    }
+
+    let right = extend_score_only_scratch(q_right, s_right, matrix, gap_open, gap_extend, x_drop, scratch);
+    // Left extension: build reversed slices in scratch profile directly
+    let left = extend_score_only_reverse(query, subject, q_center, s_center, matrix, gap_open, gap_extend, x_drop, scratch);
     left + right
 }
 
@@ -593,7 +568,7 @@ fn extend_score_only(
 
     let profile: Vec<[i32; 28]> = query.iter().map(|&q| {
         let mut row = [matrix.min_score; 28];
-        for r in 0u8..28 { row[r as usize] = matrix.score(q, r); }
+        for r in 0u8..28 { row[r as usize] = unsafe { matrix.score_unchecked(q, r) }; }
         row
     }).collect();
 
@@ -692,6 +667,167 @@ fn extend_score_only(
     best_score
 }
 
+/// Score-only one-direction extension using pre-allocated scratch buffers.
+/// The profile and subj_idx must already be populated in scratch by the caller.
+fn extend_score_only_scratch_inner(
+    qlen: usize,
+    slen: usize,
+    gap_open: i32,
+    gap_extend: i32,
+    x_drop: i32,
+    scratch: &mut GappedScratch,
+) -> i32 {
+    if qlen == 0 || slen == 0 { return 0; }
+
+    const NEG_INF: i32 = i32::MIN / 2;
+    let cols = slen + 1;
+    let gap_open_extend = gap_open + gap_extend;
+
+    scratch.h_prev[..cols].fill(NEG_INF);
+    scratch.h_prev[0] = 0;
+    scratch.f_prev[..cols].fill(NEG_INF);
+    scratch.f_curr[..cols].fill(NEG_INF);
+
+    #[cfg(target_arch = "x86_64")]
+    let use_avx2 = has_avx2();
+
+    let mut best_score = 0i32;
+    let mut j_lo: usize = 1;
+    let mut j_hi: usize = cols;
+
+    for i in 1..=qlen {
+        let j_start = if j_lo > 1 { j_lo - 1 } else { 1 };
+        let j_end = (j_hi + 1).min(cols);
+
+        scratch.h_curr[..j_end].fill(NEG_INF);
+        scratch.e_curr[..j_end].fill(NEG_INF);
+
+        let q_profile = scratch.profile[i - 1];
+        for j in j_start..j_end {
+            scratch.subject_scores[j - 1] = q_profile[scratch.subj_idx[j - 1]];
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if use_avx2 {
+            unsafe {
+                compute_f_avx2(&scratch.h_prev, &scratch.f_prev, &mut scratch.f_curr, gap_open_extend, gap_extend, j_start, j_end);
+                compute_diag_avx2(&scratch.h_prev, &scratch.subject_scores, &mut scratch.diag_scores, j_start, j_end);
+            }
+        } else {
+            for j in j_start..j_end {
+                scratch.f_curr[j] = (scratch.h_prev[j] - gap_open_extend).max(scratch.f_prev[j] - gap_extend);
+            }
+            for j in j_start..j_end {
+                scratch.diag_scores[j] = scratch.h_prev[j - 1] + scratch.subject_scores[j - 1];
+            }
+        }
+
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            for j in j_start..j_end {
+                scratch.f_curr[j] = (scratch.h_prev[j] - gap_open_extend).max(scratch.f_prev[j] - gap_extend);
+            }
+            for j in j_start..j_end {
+                scratch.diag_scores[j] = scratch.h_prev[j - 1] + scratch.subject_scores[j - 1];
+            }
+        }
+
+        for j in j_start..j_end {
+            scratch.e_curr[j] = (scratch.h_curr[j - 1] - gap_open_extend).max(scratch.e_curr[j - 1] - gap_extend);
+        }
+
+        let mut row_has_valid = false;
+        let mut new_j_lo = j_end;
+        let mut new_j_hi = j_start;
+        let drop_threshold = best_score - x_drop;
+
+        for j in j_start..j_end {
+            let cell_score = scratch.diag_scores[j].max(scratch.e_curr[j]).max(scratch.f_curr[j]);
+            if cell_score >= drop_threshold {
+                scratch.h_curr[j] = cell_score;
+                if cell_score > best_score { best_score = cell_score; }
+                row_has_valid = true;
+                if j < new_j_lo { new_j_lo = j; }
+                new_j_hi = j + 1;
+            } else {
+                scratch.h_curr[j] = NEG_INF;
+            }
+        }
+
+        if !row_has_valid { break; }
+        j_lo = new_j_lo;
+        j_hi = new_j_hi;
+
+        std::mem::swap(&mut scratch.h_prev, &mut scratch.h_curr);
+        std::mem::swap(&mut scratch.f_prev, &mut scratch.f_curr);
+    }
+
+    best_score
+}
+
+/// Score-only forward extension with scratch buffers.
+fn extend_score_only_scratch(
+    query: &[u8],
+    subject: &[u8],
+    matrix: &ScoringMatrix,
+    gap_open: i32,
+    gap_extend: i32,
+    x_drop: i32,
+    scratch: &mut GappedScratch,
+) -> i32 {
+    let qlen = query.len();
+    let slen = subject.len();
+    if qlen == 0 || slen == 0 { return 0; }
+
+    scratch.ensure_capacity(qlen, slen);
+
+    for (i, &q) in query.iter().enumerate() {
+        let row = &mut scratch.profile[i];
+        *row = [matrix.min_score; 28];
+        for r in 0u8..28 { row[r as usize] = unsafe { matrix.score_unchecked(q, r) }; }
+    }
+    for (i, &b) in subject.iter().enumerate() {
+        scratch.subj_idx[i] = (b as usize) % 28;
+    }
+
+    extend_score_only_scratch_inner(qlen, slen, gap_open, gap_extend, x_drop, scratch)
+}
+
+/// Score-only left extension: builds profile in reverse order directly in scratch
+/// buffers, avoiding allocation of reversed copies.
+#[allow(clippy::too_many_arguments)]
+fn extend_score_only_reverse(
+    query: &[u8],
+    subject: &[u8],
+    q_center: usize,
+    s_center: usize,
+    matrix: &ScoringMatrix,
+    gap_open: i32,
+    gap_extend: i32,
+    x_drop: i32,
+    scratch: &mut GappedScratch,
+) -> i32 {
+    let qlen = q_center;
+    let slen = s_center;
+    if qlen == 0 || slen == 0 { return 0; }
+
+    scratch.ensure_capacity(qlen, slen);
+
+    // Build profile in reverse: profile[0] = score row for query[q_center-1], etc.
+    for i in 0..qlen {
+        let q = query[q_center - 1 - i];
+        let row = &mut scratch.profile[i];
+        *row = [matrix.min_score; 28];
+        for r in 0u8..28 { row[r as usize] = unsafe { matrix.score_unchecked(q, r) }; }
+    }
+    // Build subject index in reverse
+    for i in 0..slen {
+        scratch.subj_idx[i] = (subject[s_center - 1 - i] as usize) % 28;
+    }
+
+    extend_score_only_scratch_inner(qlen, slen, gap_open, gap_extend, x_drop, scratch)
+}
+
 struct DirectionResult {
     score: i32,
     query_len: usize,
@@ -701,7 +837,49 @@ struct DirectionResult {
     subject_aln: Vec<u8>,
 }
 
-/// Extend in one direction using affine gap DP.
+/// Thread-local reusable buffers for traceback DP extension.
+struct TracebackScratch {
+    profile: Vec<[i32; 28]>,
+    subj_idx: Vec<usize>,
+    h_prev: Vec<i32>,
+    h_curr: Vec<i32>,
+    e_curr: Vec<i32>,
+    f_prev: Vec<i32>,
+    f_curr: Vec<i32>,
+    diag_scores: Vec<i32>,
+    subject_scores: Vec<i32>,
+}
+
+impl TracebackScratch {
+    fn new() -> Self {
+        TracebackScratch {
+            profile: Vec::new(), subj_idx: Vec::new(),
+            h_prev: Vec::new(), h_curr: Vec::new(), e_curr: Vec::new(),
+            f_prev: Vec::new(), f_curr: Vec::new(),
+            diag_scores: Vec::new(), subject_scores: Vec::new(),
+        }
+    }
+
+    fn ensure_capacity(&mut self, qlen: usize, slen: usize) {
+        let cols = slen + 1;
+        if self.profile.len() < qlen { self.profile.resize(qlen, [0i32; 28]); }
+        if self.subj_idx.len() < slen { self.subj_idx.resize(slen, 0); }
+        if self.h_prev.len() < cols { self.h_prev.resize(cols, 0); }
+        if self.h_curr.len() < cols { self.h_curr.resize(cols, 0); }
+        if self.e_curr.len() < cols { self.e_curr.resize(cols, 0); }
+        if self.f_prev.len() < cols { self.f_prev.resize(cols, 0); }
+        if self.f_curr.len() < cols { self.f_curr.resize(cols, 0); }
+        if self.diag_scores.len() < cols { self.diag_scores.resize(cols, 0); }
+        if self.subject_scores.len() < slen { self.subject_scores.resize(slen, 0); }
+    }
+}
+
+thread_local! {
+    static TB_SCRATCH: std::cell::RefCell<TracebackScratch> = std::cell::RefCell::new(TracebackScratch::new());
+}
+
+/// Extend in one direction using affine gap DP with banded traceback.
+/// Only stores traceback within the X-drop band, reducing memory from O(qlen*slen) to O(qlen*bandwidth).
 fn extend_one_direction(
     query: &[u8],
     subject: &[u8],
@@ -715,170 +893,192 @@ fn extend_one_direction(
 
     if qlen == 0 || slen == 0 {
         return DirectionResult {
-            score: 0,
-            query_len: 0,
-            subject_len: 0,
-            query_aln: vec![],
-            midline: vec![],
-            subject_aln: vec![],
+            score: 0, query_len: 0, subject_len: 0,
+            query_aln: vec![], midline: vec![], subject_aln: vec![],
         };
     }
 
-    // Banded X-drop DP with traceback.
-    // The inner loop is split into vectorizable (F, diagonal scores) and sequential (E, H) phases.
-    // Branchless arithmetic enables LLVM auto-vectorization of the independent loops.
+    TB_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        extend_one_direction_inner(query, subject, qlen, slen, matrix, gap_open, gap_extend, x_drop, &mut s, false, 0, 0)
+    })
+}
+
+/// Core DP + traceback implementation shared by forward and reverse extensions.
+/// When `reverse` is true, profile/subj_idx are built from reversed indexing into query/subject.
+#[allow(clippy::too_many_arguments)]
+fn extend_one_direction_inner(
+    query: &[u8],
+    subject: &[u8],
+    qlen: usize,
+    slen: usize,
+    matrix: &ScoringMatrix,
+    gap_open: i32,
+    gap_extend: i32,
+    x_drop: i32,
+    scratch: &mut TracebackScratch,
+    reverse: bool,
+    q_center: usize,
+    s_center: usize,
+) -> DirectionResult {
     const NEG_INF: i32 = i32::MIN / 2;
-    let rows = qlen + 1;
     let cols = slen + 1;
     let gap_open_extend = gap_open + gap_extend;
 
-    let profile: Vec<[i32; 28]> = query.iter().map(|&q| {
-        let mut row = [matrix.min_score; 28];
-        for r in 0u8..28 {
-            row[r as usize] = matrix.score(q, r);
-        }
-        row
-    }).collect();
+    scratch.ensure_capacity(qlen, slen);
 
-    let subj_idx: Vec<usize> = subject.iter().map(|&b| (b as usize) % 28).collect();
+    // Build profile (forward or reverse)
+    for i in 0..qlen {
+        let q = if reverse { query[q_center - 1 - i] } else { query[i] };
+        let row = &mut scratch.profile[i];
+        *row = [matrix.min_score; 28];
+        for r in 0u8..28 { row[r as usize] = unsafe { matrix.score_unchecked(q, r) }; }
+    }
+    for i in 0..slen {
+        let b = if reverse { subject[s_center - 1 - i] } else { subject[i] };
+        scratch.subj_idx[i] = (b as usize) % 28;
+    }
 
-    let mut h_prev = vec![NEG_INF; cols];
-    let mut h_curr = vec![NEG_INF; cols];
-    let mut e_curr = vec![NEG_INF; cols];
-    let mut f_prev = vec![NEG_INF; cols];
-    let mut f_curr = vec![NEG_INF; cols];
-    let mut diag_scores = vec![NEG_INF; cols];
-    let mut subject_scores = vec![0i32; slen];
-    let mut tb = vec![0u8; rows * cols];
+    scratch.h_prev[..cols].fill(NEG_INF);
+    scratch.h_prev[0] = 0;
+    scratch.f_prev[..cols].fill(NEG_INF);
+    scratch.f_curr[..cols].fill(NEG_INF);
+
+    // Flat traceback storage: single Vec for all band data, plus offset index per row.
+    // Avoids per-row Vec allocation (~qlen allocations saved).
+    let mut tb_data: Vec<u8> = Vec::with_capacity(qlen * 32); // rough estimate
+    let mut tb_offsets: Vec<(usize, usize, usize)> = Vec::with_capacity(qlen + 1); // (j_start, data_offset, width)
+    tb_offsets.push((0, 0, 0)); // row 0 placeholder
 
     #[cfg(target_arch = "x86_64")]
     let use_avx2 = has_avx2();
 
-    h_prev[0] = 0;
-
     let mut best_score = 0i32;
     let mut best_i = 0usize;
     let mut best_j = 0usize;
-
     let mut j_lo: usize = 1;
     let mut j_hi: usize = cols;
 
-    for i in 1..rows {
-        let q_profile = &profile[i - 1];
-
+    for i in 1..=qlen {
+        let q_profile = scratch.profile[i - 1];
         let j_start = if j_lo > 1 { j_lo - 1 } else { 1 };
         let j_end = (j_hi + 1).min(cols);
 
-        h_curr[..j_end].fill(NEG_INF);
-        e_curr[..j_end].fill(NEG_INF);
+        scratch.h_curr[..j_end].fill(NEG_INF);
+        scratch.e_curr[..j_end].fill(NEG_INF);
 
         for j in j_start..j_end {
-            subject_scores[j - 1] = q_profile[subj_idx[j - 1]];
+            scratch.subject_scores[j - 1] = q_profile[scratch.subj_idx[j - 1]];
         }
 
         #[cfg(target_arch = "x86_64")]
         if use_avx2 {
             unsafe {
-                compute_f_avx2(&h_prev, &f_prev, &mut f_curr, gap_open_extend, gap_extend, j_start, j_end);
-                compute_diag_avx2(&h_prev, &subject_scores, &mut diag_scores, j_start, j_end);
+                compute_f_avx2(&scratch.h_prev, &scratch.f_prev, &mut scratch.f_curr, gap_open_extend, gap_extend, j_start, j_end);
+                compute_diag_avx2(&scratch.h_prev, &scratch.subject_scores, &mut scratch.diag_scores, j_start, j_end);
             }
         } else {
             for j in j_start..j_end {
-                f_curr[j] = (h_prev[j] - gap_open_extend).max(f_prev[j] - gap_extend);
+                scratch.f_curr[j] = (scratch.h_prev[j] - gap_open_extend).max(scratch.f_prev[j] - gap_extend);
             }
             for j in j_start..j_end {
-                diag_scores[j] = h_prev[j - 1] + subject_scores[j - 1];
+                scratch.diag_scores[j] = scratch.h_prev[j - 1] + scratch.subject_scores[j - 1];
             }
         }
 
         #[cfg(not(target_arch = "x86_64"))]
         {
             for j in j_start..j_end {
-                f_curr[j] = (h_prev[j] - gap_open_extend).max(f_prev[j] - gap_extend);
+                scratch.f_curr[j] = (scratch.h_prev[j] - gap_open_extend).max(scratch.f_prev[j] - gap_extend);
             }
             for j in j_start..j_end {
-                diag_scores[j] = h_prev[j - 1] + subject_scores[j - 1];
+                scratch.diag_scores[j] = scratch.h_prev[j - 1] + scratch.subject_scores[j - 1];
             }
         }
 
-        // Step 3: Sequential left-to-right sweep for E, H, and traceback
         let mut row_has_valid = false;
         let mut new_j_lo = j_end;
         let mut new_j_hi = j_start;
         let drop_threshold = best_score - x_drop;
+        let band_width = j_end - j_start;
+        let band_offset = tb_data.len();
+        tb_data.resize(band_offset + band_width, 0u8);
 
         for j in j_start..j_end {
-            e_curr[j] = (h_curr[j - 1] - gap_open_extend).max(e_curr[j - 1] - gap_extend);
+            scratch.e_curr[j] = (scratch.h_curr[j - 1] - gap_open_extend).max(scratch.e_curr[j - 1] - gap_extend);
+            let cell_score = scratch.diag_scores[j].max(scratch.e_curr[j]).max(scratch.f_curr[j]);
 
-            let cell_score = diag_scores[j].max(e_curr[j]).max(f_curr[j]);
-
-            let tb_idx = i * cols + j;
             if cell_score >= drop_threshold {
-                h_curr[j] = cell_score;
-                if cell_score == diag_scores[j] {
-                    tb[tb_idx] = 1;
-                } else if cell_score == e_curr[j] {
-                    tb[tb_idx] = 3;
-                } else {
-                    tb[tb_idx] = 2;
-                }
+                scratch.h_curr[j] = cell_score;
+                let tb_val = if cell_score == scratch.diag_scores[j] { 1u8 }
+                    else if cell_score == scratch.e_curr[j] { 3u8 }
+                    else { 2u8 };
+                tb_data[band_offset + j - j_start] = tb_val;
 
                 if cell_score > best_score {
                     best_score = cell_score;
                     best_i = i;
                     best_j = j;
                 }
-
                 row_has_valid = true;
                 if j < new_j_lo { new_j_lo = j; }
                 new_j_hi = j + 1;
             } else {
-                h_curr[j] = NEG_INF;
-                tb[tb_idx] = 0;
+                scratch.h_curr[j] = NEG_INF;
             }
         }
 
-        if !row_has_valid {
-            break;
-        }
+        tb_offsets.push((j_start, band_offset, band_width));
 
+        if !row_has_valid { break; }
         j_lo = new_j_lo;
         j_hi = new_j_hi;
 
-        std::mem::swap(&mut h_prev, &mut h_curr);
-        std::mem::swap(&mut f_prev, &mut f_curr);
+        std::mem::swap(&mut scratch.h_prev, &mut scratch.h_curr);
+        std::mem::swap(&mut scratch.f_prev, &mut scratch.f_curr);
     }
 
-    // Traceback from (best_i, best_j)
+    // Traceback from (best_i, best_j) using banded storage
     let mut query_aln = Vec::new();
     let mut midline = Vec::new();
     let mut subject_aln = Vec::new();
 
-    let mut i = best_i;
-    let mut j = best_j;
-    while i > 0 || j > 0 {
-        let idx = i * cols + j;
-        match tb[idx] {
+    let mut ti = best_i;
+    let mut tj = best_j;
+    while ti > 0 || tj > 0 {
+        if ti >= tb_offsets.len() { break; }
+        let (band_start, data_offset, width) = tb_offsets[ti];
+        let band_idx = tj.wrapping_sub(band_start);
+        let tb_val = if band_idx < width { tb_data[data_offset + band_idx] } else { 0 };
+        match tb_val {
             1 => {
-                let qi = query[i - 1];
-                let si = subject[j - 1];
+                // Map DP index back to original sequence position
+                let (qi_idx, si_idx) = if reverse {
+                    (q_center - ti, s_center - tj)
+                } else {
+                    (ti - 1, tj - 1)
+                };
+                let qi = query[qi_idx];
+                let si = subject[si_idx];
                 query_aln.push(qi);
                 subject_aln.push(si);
                 midline.push(if qi == si { b'|' } else { b' ' });
-                i -= 1;
-                j -= 1;
+                ti -= 1;
+                tj -= 1;
             }
             2 => {
-                query_aln.push(query[i - 1]);
+                let qi_idx = if reverse { q_center - ti } else { ti - 1 };
+                query_aln.push(query[qi_idx]);
                 midline.push(b' ');
                 subject_aln.push(b'-');
-                i -= 1;
+                ti -= 1;
             }
             3 => {
+                let si_idx = if reverse { s_center - tj } else { tj - 1 };
                 query_aln.push(b'-');
                 midline.push(b' ');
-                subject_aln.push(subject[j - 1]);
-                j -= 1;
+                subject_aln.push(subject[si_idx]);
+                tj -= 1;
             }
             _ => break,
         }
@@ -898,6 +1098,35 @@ fn extend_one_direction(
     }
 }
 
+/// Reverse left extension with traceback using thread-local scratch buffers.
+/// Returns alignment strings in forward (left-to-right) order.
+#[allow(clippy::too_many_arguments)]
+fn extend_one_direction_reverse(
+    query: &[u8],
+    subject: &[u8],
+    q_center: usize,
+    s_center: usize,
+    matrix: &ScoringMatrix,
+    gap_open: i32,
+    gap_extend: i32,
+    x_drop: i32,
+) -> DirectionResult {
+    let qlen = q_center;
+    let slen = s_center;
+
+    if qlen == 0 || slen == 0 {
+        return DirectionResult {
+            score: 0, query_len: 0, subject_len: 0,
+            query_aln: vec![], midline: vec![], subject_aln: vec![],
+        };
+    }
+
+    TB_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        extend_one_direction_inner(query, subject, qlen, slen, matrix, gap_open, gap_extend, x_drop, &mut s, true, q_center, s_center)
+    })
+}
+
 /// Nucleotide ungapped extension with match/mismatch scoring.
 pub fn ungapped_extend_nucleotide(
     query: &[u8],
@@ -908,13 +1137,9 @@ pub fn ungapped_extend_nucleotide(
     mismatch: i32,
     x_drop: i32,
 ) -> UngappedHit {
-    // Use a simple scoring: treat query/subject as ASCII nucleotides
+    // Branchless case-insensitive nucleotide comparison via OR 0x20
     let score_fn = |a: u8, b: u8| -> i32 {
-        if a.eq_ignore_ascii_case(&b) {
-            match_score
-        } else {
-            mismatch
-        }
+        if (a | 0x20) == (b | 0x20) { match_score } else { mismatch }
     };
 
     let mut best = 0i32;

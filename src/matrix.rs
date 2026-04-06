@@ -83,6 +83,13 @@ impl ScoringMatrix {
             self.min_score
         }
     }
+
+    /// Unchecked score lookup — caller guarantees a, b < 28.
+    /// Eliminates bounds check branch from hot inner loops.
+    #[inline(always)]
+    pub unsafe fn score_unchecked(&self, a: u8, b: u8) -> i32 {
+        *self.scores.get_unchecked(a as usize).get_unchecked(b as usize)
+    }
 }
 
 /// Order of residues in the raw matrix tables (Ncbistdaa codes).

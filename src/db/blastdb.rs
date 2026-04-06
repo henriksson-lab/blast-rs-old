@@ -212,12 +212,16 @@ impl BlastDb {
     }
 
     /// Resolve a global OID to (volume_index, local_oid).
-    #[inline]
+    #[inline(always)]
     fn resolve_oid(&self, oid: u32) -> Result<(usize, u32)> {
         if oid >= self.total_seqs {
             return Err(DbError::OidOutOfRange(oid));
         }
-        // Binary search for the right volume
+        // Fast path: single volume (common case)
+        if self.volumes.len() == 1 {
+            return Ok((0, oid));
+        }
+        // Multi-volume: binary search
         let mut lo = 0;
         let mut hi = self.volumes.len();
         while lo < hi {
